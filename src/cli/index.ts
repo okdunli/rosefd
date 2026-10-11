@@ -1443,7 +1443,7 @@ function copyTemplate(dir: string, name: string, display: string): void {
   if (fs.existsSync(pkgFile)) {
     const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
     pkg.name = path.basename(dir);
-    if (pkg.dependencies?.rosefd) pkg.dependencies.rosefd = 'latest';
+    if (pkg.dependencies?.rosefd) pkg.dependencies.rosefd = `^${version()}`;
     pkg.devDependencies = { ...pkg.devDependencies, typescript: '^5.6.0' };
     fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n');
   }
