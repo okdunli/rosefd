@@ -146,6 +146,19 @@ function pickEncoding(raw: Buffer, accept: string): 'br' | 'gzip' | null {
   return /br\b/i.test(accept) ? 'br' : /gzip\b/i.test(accept) ? 'gzip' : null;
 }
 
+// Vary is a list header, and two independent parties write it: the server
+// negotiates the body on Accept-Encoding, and a route may declare its own
+// dimensions (an i18n redirect varies on Accept-Language). setHeader replaces
+// by name, so a naive write on either side silently drops the other - merge,
+// deduped case-insensitively.
+function addVary(res: http.ServerResponse, dim: string): void {
+  const have = res.getHeader('vary');
+  const raw = have == null ? '' : Array.isArray(have) ? have.join(', ') : String(have);
+  const parts = raw.split(',').map((s: string) => s.trim()).filter(Boolean);
+  if (!parts.some((p: string) => p.toLowerCase() === dim.toLowerCase())) parts.push(dim);
+  res.setHeader('Vary', parts.join(', '));
+}
+
 const NO_COMPRESS_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.webp', '.avif', '.gif', '.ico',
   '.woff', '.woff2', '.mp4', '.webm', '.mp3', '.pdf', '.zip', '.gz', '.br',
@@ -430,7 +443,7 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
   res.statusCode = 200;
   res.setHeader('Content-Type', TYPES[ext]);
   res.setHeader('ETag', entry.etag);
-  res.setHeader('Vary', 'Accept-Encoding');
+  addVary(res, 'Accept-Encoding');
   const isEntryDoc = pathname === '/' || pathname.endsWith('/') || TYPES[ext].startsWith('text/html');
   const immutableAsset =
     pathname.startsWith('/chunks/') ||
@@ -517,6 +530,11 @@ const server = http.createServer(async (req, res) => {
     }
     res.statusCode = response.status;
     response.headers.forEach((v, k) => res.setHeader(k, v));
+    // The bytes below are content-negotiated on Accept-Encoding, so a cache
+    // must know the response varies by it. Merged, not written: the edge
+    // response may carry the app's own dimensions (an i18n redirect varies on
+    // Accept-Language) and setHeader would drop them.
+    addVary(res, 'Accept-Encoding');
     const htmlDoc = (response.headers.get('content-type') ?? '').startsWith('text/html');
     const accept = String(req.headers['accept-encoding'] ?? '');
     const raw = response.body ? Buffer.from(await response.arrayBuffer()) : null;

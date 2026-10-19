@@ -101,17 +101,23 @@ func writeBody(w http.ResponseWriter, r *http.Request, name string, body []byte,
 	h.Set("Content-Type", mimeOf(name))
 	h.Set("Cache-Control", "public, max-age=3600")
 	h.Set("ETag", etag)
-	h.Set("Vary", "Accept-Encoding")
-	
-	
-	
-	
+
 	if strings.HasPrefix(mimeOf(name), "text/html") {
 		for k, v := range headersFor(r.URL.Path) {
 			h.Set(k, v)
 		}
 	}
-	
+
+	// The bytes below are content-negotiated on Accept-Encoding, and a route
+	// may declare its own Vary dimensions (an i18n redirect varies on
+	// Accept-Language). Header.Set replaces by name, so merge - a cache must
+	// see both dimensions, never just the last writer's.
+	if vary := h.Get("Vary"); vary == "" {
+		h.Set("Vary", "Accept-Encoding")
+	} else if !strings.Contains(strings.ToLower(vary), "accept-encoding") {
+		h.Set("Vary", vary+", Accept-Encoding")
+	}
+
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
