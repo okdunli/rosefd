@@ -143,8 +143,14 @@ assert(seam.prefetch && typeof seam.prefetch.cached === 'number' && seam.prefetc
 
 assert(document.title === 'Rose Frame Driver', 'layout <title> served in <head>');
 assert(document.querySelector('meta[name="generator"]')?.getAttribute('content') === 'Rose Frame Driver', 'layout meta served in <head>');
+// The home page is a STREAMED route: its head blocks legitimately ride in the
+// body inside marker pairs (the no-FOUC contract - the client relocates them
+// into <head> at boot, which the post-nav assertions below prove). What must
+// never happen is head content OUTSIDE those markers: that is a real leak.
 const noScripts = html.replace(/<script[\s\S]*?<\/script>/g, '');
-assert(!/<title|<meta/i.test(noScripts.slice(noScripts.indexOf('<body>'))), 'no head content leaks into the served body');
+const servedBody = noScripts.slice(noScripts.indexOf('<body>'));
+const unmarked = servedBody.replace(/<!--\u27e6h:\d+\u27e7-->[\s\S]*?<!--\u27e6\/h:\d+\u27e7-->/g, '');
+assert(!/<title|<meta/i.test(unmarked), 'no head content leaks outside the streamed head markers');
 assert(/rel="icon" href="data:image\/svg\+xml,/.test(html), 'inline favicon served in <head>');
 
 aboutLink.click();
@@ -322,9 +328,18 @@ box.set({ n: 5 });
 assert(seen.length === 1, 'a null transport disables the broadcast (single-process runners have no peer)');
 assert($store('never-seen', { ok: true }).get().ok === true, 'an unknown store seeds from its initial value');
 
-const styleBlock = html.match(/<style>([\s\S]*?)<\/style>/g)!.join('');
+// The inlined client bundle carries every route's render code as text, so a
+// raw regex over the document matches template strings, not style elements.
+// Strip the scripts first, then the surviving <style> blocks are the real ones.
+const styleBlock = (noScripts.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('');
 assert(styleBlock.includes('[data-rosefd-c="index"] .rcard'), 'the served document inlines the scoped index rules');
-assert(styleBlock.includes('[data-rosefd-c="about"] .rcard'), 'the served document inlines the scoped about rules');
+// Route-scoped, not site-wide: the ABOUT rules belong to the about document,
+// and the home document must NOT carry them (the old styles.css union leaked
+// every route's rules into every document - fixed, and asserted here).
+assert(!styleBlock.includes('[data-rosefd-c="about"] .rcard'), 'the home document does not carry the about rules');
+const aboutNoScripts = (await (await fetch(BASE + '/about')).text()).replace(/<script[\s\S]*?<\/script>/g, '');
+const aboutStyleBlock = (aboutNoScripts.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('');
+assert(aboutStyleBlock.includes('[data-rosefd-c="about"] .rcard'), 'the about document inlines the scoped about rules');
 assert(!/<link[^>]+stylesheet/i.test(html), 'zero stylesheet requests (styles ride in the document)');
 const liveCard = document.querySelector('.rcard')!;
 assert(liveCard.closest('[data-rosefd-c]')!.getAttribute('data-rosefd-c') === 'index', 'the live home card belongs to the index scope');
@@ -396,7 +411,12 @@ assert(document.body.textContent!.includes('This section failed to render.'), 't
 
 const streamRes = await fetch(BASE + '/admin', { headers: { cookie: 'session=Ada' } });
 assert(streamRes.status === 200, 'a streamed route serves with 200');
-assert(streamRes.headers.get('transfer-encoding') === 'chunked', 'the response is really streamed (chunked transfer encoding)');
+// The transport is no longer chunked under any server mode: serve routes
+// dynamic requests through the edge handler (T9 - the same compiled code the
+// adapters run), which answers a complete Response, and dev never streams
+// (the !dev gate keeps hot-reload simple). What the streaming contract still
+// guarantees is the document SHAPE - head blocks riding in the body inside
+// marker pairs - asserted below.
 const streamHtml = await streamRes.text();
 assert(streamHtml.startsWith('<!DOCTYPE html>'), 'the streamed document is complete from the first byte');
 assert(streamHtml.includes('<div id="app">'), 'the streamed document opens the app container');
@@ -490,10 +510,14 @@ assert(wireBr.headers['content-encoding'] === 'br', 'brotli preferred over gzip 
 assert(wireBr.body.length < wireGz.body.length, `brotli wire bytes < gzip (${wireBr.body.length} < ${wireGz.body.length})`);
 assert(brotliDecompressSync(wireBr.body).toString().includes('🌹 Rose Frame Driver'), 'brotli body decompresses to the full document');
 
-const etag = wireIdentity.headers['etag'];
+// The static branch: a baked route served from disk. /blog/1 is baked and
+// NOT in dynamicRoutes, so it takes the file path - unlike / above, which is
+// dynamic and rides the edge handler.
+const wireStatic = await rawGet('/blog/1');
+const etag = wireStatic.headers['etag'];
 assert(!!etag, 'static file carries an ETag');
-assert((wireIdentity.headers['cache-control'] || '').includes('max-age=3600'), 'static file carries Cache-Control');
-const wire304 = await rawGet('/', { 'if-none-match': etag! });
+assert((wireStatic.headers['cache-control'] || '').includes('max-age=3600'), 'static file carries Cache-Control');
+const wire304 = await rawGet('/blog/1', { 'if-none-match': etag! });
 assert(wire304.status === 304, 'If-None-Match -> 304');
 assert(wire304.body.length === 0, 'the 304 carries no body');
 
@@ -506,8 +530,24 @@ assert(wireStreamDoc.includes('Blog Post'), 'the buffered zero-JS+gzip document 
 assert(wireStreamDoc.trimEnd().endsWith('</html>'), 'the buffered zero-JS+gzip document is complete');
 console.log(`wire bytes for /: raw ${wireIdentity.body.length}, gzip ${wireGz.body.length}, brotli ${wireBr.body.length}`);
 
+// Streaming is a serveStatic-path behavior, and which path answers depends on
+// the mode: serve routes dynamic requests through the edge handler (one
+// complete Response), and dev never streams (the !dev gate). The mode that
+// streams is `preview`, so these rounds spawn one and measure it directly.
+const { spawn } = await import('node:child_process');
+const streamSrv = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/cli/index.ts', 'preview', 'example'], {
+  env: { ...process.env, PORT: '3211' },
+  stdio: 'ignore',
+});
+const STREAM_BASE = 'http://localhost:3211';
+let streamUp = false;
+for (let i = 0; i < 150 && !streamUp; i++) {
+  try { streamUp = (await fetch(STREAM_BASE + '/')).status === 200; } catch { await new Promise((r) => setTimeout(r, 200)); }
+}
+assert(streamUp, 'the preview server started for the streaming rounds');
+
 const shellRound = () => new Promise<{ headers: Record<string, string>; body: Buffer; first: number; last: number }>((resolve, reject) => {
-  const where = new URL(BASE);
+  const where = new URL(STREAM_BASE);
   const t0 = performance.now();
   let first = 0;
   let last = 0;
@@ -525,20 +565,24 @@ const shellRound = () => new Promise<{ headers: Record<string, string>; body: Bu
   req.end();
 });
 
-const shellRounds = [];
-for (let i = 0; i < 5; i++) shellRounds.push(await shellRound());
-for (const [i, r] of shellRounds.entries()) {
-  assert(r.headers['content-encoding'] === 'br', `streamed round ${i}: brotli negotiated`);
-  assert(r.headers['transfer-encoding'] === 'chunked', `streamed round ${i}: delivered chunked, not one blob`);
-  const doc = brotliDecompressSync(r.body).toString();
-  assert(doc.includes('Sign the book'), `streamed round ${i}: the document carries the route`);
-  assert(doc.trimEnd().endsWith('</html>'), `streamed round ${i}: the flushed brotli stream decompresses to a complete document`);
+try {
+  const shellRounds = [];
+  for (let i = 0; i < 5; i++) shellRounds.push(await shellRound());
+  for (const [i, r] of shellRounds.entries()) {
+    assert(r.headers['content-encoding'] === 'br', `streamed round ${i}: brotli negotiated`);
+    assert(r.headers['transfer-encoding'] === 'chunked', `streamed round ${i}: delivered chunked, not one blob`);
+    const doc = brotliDecompressSync(r.body).toString();
+    assert(doc.includes('Sign the book'), `streamed round ${i}: the document carries the route`);
+    assert(doc.trimEnd().endsWith('</html>'), `streamed round ${i}: the flushed brotli stream decompresses to a complete document`);
+  }
+  const gaps = shellRounds.map((r) => r.last - r.first).sort((a, b) => a - b);
+  assert(gaps[2] > 0, `the shell reaches the socket before the document completes (median gap ${gaps[2].toFixed(2)} ms over 5 rounds)`);
+  const firsts = shellRounds.map((r) => r.first).sort((a, b) => a - b);
+  assert(firsts[2] < 25, `the streamed route's first byte leaves with the shell (p50 ${firsts[2].toFixed(2)} ms; the unflushed stream measured 53 ms)`);
+  console.log(`streamed /sign: first byte p50 ${firsts[2].toFixed(2)} ms, shell-to-body gap p50 ${gaps[2].toFixed(2)} ms, ${shellRounds[0].body.length} brotli bytes`);
+} finally {
+  streamSrv.kill();
 }
-const gaps = shellRounds.map((r) => r.last - r.first).sort((a, b) => a - b);
-assert(gaps[2] > 0, `the shell reaches the socket before the document completes (median gap ${gaps[2].toFixed(2)} ms over 5 rounds)`);
-const firsts = shellRounds.map((r) => r.first).sort((a, b) => a - b);
-assert(firsts[2] < 25, `the streamed route's first byte leaves with the shell (p50 ${firsts[2].toFixed(2)} ms; the unflushed stream measured 53 ms)`);
-console.log(`streamed /sign: first byte p50 ${firsts[2].toFixed(2)} ms, shell-to-body gap p50 ${gaps[2].toFixed(2)} ms, ${shellRounds[0].body.length} brotli bytes`);
 
 const apiGet = await fetch(BASE + '/api/hello');
 assert(apiGet.status === 200, 'GET /api/hello -> 200');
@@ -629,10 +673,14 @@ await tick();
     const again = await (await fetch(PREVIEW + '/fresh')).text();
     assert(stampOf(again) === stampOf(fresh), 'the window holds: no render until the next stale request');
 
-    const pub1Res = await fetch(PREVIEW + '/');
+    // / is dynamic (it ships the client), so under preview it takes the
+    // streamed path and carries no long cache. A non-ISR route that IS served
+    // from disk - /blog/1, baked and not in dynamicRoutes - keeps the plain
+    // hour and is never swapped.
+    const pub1Res = await fetch(PREVIEW + '/blog/1');
     const pub1 = await pub1Res.text();
     await new Promise((r) => setTimeout(r, 2300));
-    const pub2 = await (await fetch(PREVIEW + '/')).text();
+    const pub2 = await (await fetch(PREVIEW + '/blog/1')).text();
     assert(pub1 === pub2, 'a route without revalidate is never swapped (static stays static)');
     assert(pub1Res.headers.get('cache-control') === 'public, max-age=3600',
       `a non-ISR route keeps the plain hour (got: ${pub1Res.headers.get('cache-control')})`);
@@ -684,11 +732,29 @@ await tick();
   assert(thornRes.headers.get('x-robots-tag') === 'noindex', 'the thorn route adds its plain header');
   const adminRes = await fetch(BASE + '/admin', { headers: { cookie: 'session=rose' } });
   assert(adminRes.headers.get('content-security-policy') === homeCsp, 'a live render carries the same strict CSP');
-  const assetRes = await fetch(BASE + '/styles.css');
+  // /styles.css only exists when a component ships CSS (this app has none, so
+  // the path 404s as an HTML document - which DOES carry the page CSP). A real
+  // asset - the client bundle - is served by the static branch without it.
+  const assetRes = await fetch(BASE + '/client.js');
+  assert(assetRes.status === 200, 'the client bundle is served as a real asset');
   assert(!assetRes.headers.get('content-security-policy'), 'assets carry no page CSP');
-  const etag = homeRes.headers.get('etag')!;
-  const revalidated = await fetch(BASE + '/', { headers: { 'if-none-match': etag } });
-  assert(revalidated.status === 304 && revalidated.headers.get('content-security-policy') === homeCsp, 'the 304 keeps the CSP');
+  // A dynamic document answers a conditional request with a bare 304 that
+  // keeps the page headers. Both requests must render the SAME bytes, and
+  // the demo home page carries per-worker in-memory state (store.likes,
+  // bumped by the $action:like POSTs earlier in this suite): under
+  // `rosefd serve`'s cluster two requests can land on workers whose
+  // renders differ. Connection reuse pins the pair to one worker; a socket
+  // recycled by either side's keep-alive timeout just needs another roll.
+  let revalidated: Response | undefined;
+  for (let attempt = 0; attempt < 6 && revalidated?.status !== 304; attempt++) {
+    const fresh = await fetch(BASE + '/');
+    const freshEtag = fresh.headers.get('etag');
+    await fresh.arrayBuffer();
+    if (!freshEtag) break; // no compression negotiated: no validator was minted
+    revalidated = await fetch(BASE + '/', { headers: { 'if-none-match': freshEtag } });
+    await revalidated.arrayBuffer();
+  }
+  assert(revalidated?.status === 304 && revalidated.headers.get('content-security-policy') === homeCsp, 'the 304 keeps the CSP');
 }
 
 {
@@ -737,7 +803,11 @@ await tick();
   assert((await frRes.text()).includes('This rose has no petals here'), 'the unknown locale serves the 404 page');
   const zhNeg = await fetch(BASE + '/about', { headers: { 'accept-language': 'zh-CN,zh;q=0.9' }, redirect: 'manual' });
   assert(zhNeg.status === 302 && zhNeg.headers.get('location') === '/zh/about', 'a zh Accept-Language redirects to /zh/about');
-  assert(zhNeg.headers.get('vary') === 'Accept-Language', 'the redirect varies on Accept-Language');
+  // Vary is a list header: the app's own dimension must survive the worker's
+  // negotiated-encoding dimension - a cache that saw only one of them would
+  // serve the wrong form to the wrong client.
+  const zhVary = (zhNeg.headers.get('vary') || '').split(',').map((s) => s.trim());
+  assert(zhVary.includes('Accept-Language') && zhVary.includes('Accept-Encoding'), 'the redirect varies on both the app dimension and the negotiated encoding');
   const frNeg = await fetch(BASE + '/about', { headers: { 'accept-language': 'fr' }, redirect: 'manual' });
   assert(frNeg.status === 200, 'a preference matching no dictionary serves the default locale in place (no redirect)');
   const starNeg = await fetch(BASE + '/about', { headers: { 'accept-language': '*' }, redirect: 'manual' });

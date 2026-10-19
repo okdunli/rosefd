@@ -38,7 +38,7 @@ let lastPostState: any = null;
   return { text: async () => getHtmlShell(page.html, page.state, page.head) };
 };
 
-const { start, startNotFound, adopt, $action, ensureLocale, loadLocale } = await import('./dist/client.js');
+const { start, startNotFound, adopt, $action, ensureLocale, loadLocale } = await import('../dist/client.js');
 
 const document = dom.window.document;
 const appEl = document.getElementById('app')!;
@@ -118,7 +118,7 @@ assert(appEl.querySelector('p strong')!.textContent === '0', 'per-route state re
 const links = Array.from(appEl.querySelectorAll('nav a'));
 assert(links.length === 8 && links[0].getAttribute('href') === '/', 'attr bindings wired from markers');
 
-const { prefetch, prefetchStats } = await import('./dist/client.js') as any;
+const { prefetch, prefetchStats } = await import('../dist/client.js') as any;
 let stats = prefetchStats();
 assert(stats.cached === 0, 'prefetch cache starts empty');
 
@@ -149,7 +149,7 @@ await start(appEl, '/blog/2', false);
 assert(appEl.textContent!.includes('Blog Post #2'), 'unprefetched navigation renders normally');
 assert(prefetchStats().cached === 0, 'miss path leaves no cache entry behind');
 
-const { prefetch: pf, prefetchStats: pfStats, setPrefetchMode } = await import('./dist/client.js') as any;
+const { prefetch: pf, prefetchStats: pfStats, setPrefetchMode } = await import('../dist/client.js') as any;
 setPrefetchMode('off');
 pf('/about', 'hover');
 await tick();
@@ -246,7 +246,14 @@ await start(appEl, '/', false);
 assert(aboutStyle() === null, 'navigating away drops the previous route head <style> (no CSS leak into later routes)');
 await start(appEl, '/about', false);
 assert(aboutStyle()?.textContent?.includes('.rfetch') === true, 'navigating back restores the route head <style>');
-assert(document.head.querySelectorAll('style[data-rosefd-head]').length === 1, 'exactly one managed head style after a round trip');
+const managedKeys = () => Array.from(document.head.querySelectorAll('[data-rosefd-head]'))
+  .map((el) => el.getAttribute('data-rosefd-head')!)
+  .sort()
+  .join(',');
+// /about carries TWO managed styles on purpose: the <head> block's .rfetch and
+// the component's own scoped .rcard - a fresh SSR load of the route has both,
+// so the round trip must land on exactly this set (no duplicate, no leak).
+assert(managedKeys() === 'meta:description,meta:generator,style:#0,style:rosefd-style-about', 'the about head set survives a round trip exactly (no dupes, no leaks)', managedKeys());
 
 (globalThis as any).location = { pathname: '/guarded' };
 await start(appEl, '/guarded', false);
@@ -292,16 +299,22 @@ assert(nf.status === 404, 'renderPage returns 404 for unmatched routes');
 assert(nf.html.includes('This rose has no petals here'), 'pages/404.rose renders for unmatched routes');
 assert(nf.head.join('').includes('<title>404 - Rose Frame Driver</title>'), 'the 404 page carries its own <title>');
   assert((await renderPage('/')).status === 200, 'matched routes still return 200');
-(globalThis as any).location = { pathname: '/nope' };
-if (false) await start(appEl, '/nope', false);
-if (false) assert(document.body.textContent!.includes('This rose has no petals here'), 'client router renders pages/404.rose');
-if (false) assert(document.title === '404 - Rose Frame Driver', 'the 404 page applies its <title> on the client');
-assert(document.body.querySelector('nav a') !== null, 'the 404 page keeps the layout nav');
+// shell = false keeps the bundle (the bootstrap wraps the shell-less SSR
+// content into #app at boot), so this not-found document DOES ship JS and its
+// state carries the __notFound stamp: the boot paints this route instead of
+// re-rendering the matched one from a null state key into a 500.
+assert(nf.csr !== false, 'a shell = false not-found document keeps the client bundle');
 assert(JSON.parse(nf.state).__notFound === true, 'the 404 document state carries the __notFound stamp');
+assert(JSON.parse(nf.state).__route === '/nope', 'the 404 state names the requested route');
 (globalThis as any).location = { pathname: '/nope' };
-if (false) await startNotFound(appEl, '/nope');
-if (false) assert(appEl.textContent!.includes('This rose has no petals here'), 'startNotFound paints the themed 404 from the resumed state');
-if (false) assert(document.title === '404 - Rose Frame Driver', 'startNotFound applies the 404 <title>');
+await start(appEl, '/nope', false);
+assert(document.body.textContent!.includes('This rose has no petals here'), 'client router renders pages/404.rose');
+assert(document.title === '404 - Rose Frame Driver', 'the 404 page applies its <title> on the client');
+assert(document.body.querySelector('nav a') !== null, 'the 404 page keeps the layout nav');
+(globalThis as any).location = { pathname: '/nope' };
+await startNotFound(appEl, '/nope');
+assert(appEl.textContent!.includes('This rose has no petals here'), 'startNotFound paints the themed 404 from the resumed state');
+assert(document.title === '404 - Rose Frame Driver', 'startNotFound applies the 404 <title>');
 assert(!appEl.textContent!.includes('500'), 'startNotFound never lands on the built-in 500 (the null-data catch-all trap)');
 
 (globalThis as any).location = { pathname: '/mirror404' };
@@ -380,7 +393,12 @@ assert(doc.includes('<script>bundle</script>'), 'the streamed document carries t
 assert(doc.trimEnd().endsWith('</html>'), 'the streamed document is complete');
 assert(JSON.parse(doc.match(/id="__rosefd_state">([\s\S]*?)<\/script>/)![1]).__route === '/', 'the streamed state names the requested route');
 const homeBuffered = await renderPage('/');
-assert(doc.includes(homeBuffered.html), 'the streamed body matches the buffered render byte for byte');
+// Streaming keeps each head block's CONTENT inline in the body on purpose (no
+// FOUC on first paint, a no-JS route stays styled); the buffered path moves it
+// to <head> through the shell. Strip the streamed inline content and the two
+// bodies must then agree byte for byte.
+const stripHeadBlocks = (h: string) => h.replace(/<!--\u27e6h:(\d+)\u27e7-->[\s\S]*?<!--\u27e6\/h:\1\u27e7-->/g, (_, id) => `<!--\u27e6h:${id}\u27e7--><!--\u27e6/h:${id}\u27e7-->`);
+assert(stripHeadBlocks(doc).includes(homeBuffered.html), 'the streamed body matches the buffered render byte for byte (head blocks aside)');
 const noJsChunks: string[] = [];
 const noJsStatus = await renderPageStream('/blog/3', (c) => noJsChunks.push(c), shellOpen(), '<script>bundle</script>');
 const noJsDoc = noJsChunks.join('');
@@ -390,8 +408,13 @@ assert(!noJsDoc.includes('id="__rosefd_state"'), 'the streamed no-JS document ca
 assert(!noJsDoc.includes('<script>bundle</script>'), 'the streamed no-JS document carries no client script');
 assert(noJsDoc.trimEnd().endsWith('</html>'), 'the streamed no-JS document is complete');
 const buffered = await renderPage('/blog/3');
-assert(noJsDoc.includes(buffered.html), 'the streamed no-JS body matches the buffered render byte for byte');
-assert(JSON.parse(buffered.state).id === '3', 'the buffered no-JS render still seeds the route param into its state');
+assert(stripHeadBlocks(noJsDoc).includes(buffered.html), 'the streamed no-JS body matches the buffered render byte for byte (head blocks aside)');
+// A no-JS document carries no state script at all: the route param seeding
+// shows up in the rendered HTML instead (this page resolved post #3).
+assert(buffered.state === '{}', 'the buffered no-JS render carries no state script');
+assert(buffered.csr === false, 'the buffered no-JS render is stamped csr:false');
+// SSR text is split by marker comments - assert on the value substrings only.
+assert(buffered.html.includes('>3</h1>') && buffered.html.includes('This post does not exist.'), 'the buffered no-JS render still resolves the route param into its html');
 const brokenChunks: string[] = [];
 const brokenStatus = await renderPageStream('/broken', (c) => brokenChunks.push(c), shellOpen(), '<script>bundle</script>');
 assert(brokenStatus === 200, 'a broken route still completes the stream (status was already flushed)');
@@ -460,11 +483,16 @@ await tick();
 assert(likesOf() === lastPostState.likes, '$action adopts the server response from any code path');
 assert(likesOf() === afterClick + 1, 'the server store advanced exactly once per action call');
 
-const styles = readFileSync('dist/styles.css', 'utf-8');
-assert(styles.includes('[data-rosefd-c="index"] .rcard'), "index's card rule is scoped to its component");
-assert(styles.includes('[data-rosefd-c="about"] .rcard'), "about's card rule is scoped to its component");
-const bare = styles.replace(/\[data-rosefd-c="[^"]+"\]\s*\.rcard/g, '');
-assert(!/\.rcard\s*\{/.test(bare), 'no unscoped .rcard rule survives scoping');
+// Page/layout <style> is route-scoped and ships as a managed head block;
+// dist/styles.css carries only src/components CSS (this app has none, so the
+// file is absent). Each document carries its own chain's rules, pre-scoped.
+const homeStyles = home.head.join('');
+const aboutStyles = (await renderPage('/about')).head.join('');
+assert(homeStyles.includes('[data-rosefd-c="index"] .rcard{'), "index's card rule is scoped to its component in the route head", homeStyles);
+assert(aboutStyles.includes('[data-rosefd-c="about"] .rcard{'), "about's card rule is scoped to its component in the route head", aboutStyles);
+const stripped = (homeStyles + aboutStyles).replace(/\[data-rosefd-c="[^"]+"\]\s*\.rcard/g, '');
+assert(!/\.rcard\s*\{/.test(stripped), 'no unscoped .rcard rule survives scoping');
+assert(!existsSync('dist/styles.css'), 'no styles.css is emitted when no component carries CSS');
 assert(home.html.includes('data-rosefd-c="index"'), 'the styled component root carries its scope attribute');
 assert(clientSrc.includes('data-rosefd-c="index"'), 'client-side renders keep the scope attribute');
 appEl.innerHTML = home.html;
@@ -476,8 +504,12 @@ const aboutCard = scopeAboutDoc.querySelector('.rcard')!;
 assert(aboutCard.closest('[data-rosefd-c]')!.getAttribute('data-rosefd-c') === 'about', 'the about card belongs to the about scope');
 const signPage = await renderPage('/sign');
 assert(!signPage.html.includes('data-rosefd-c='), 'unstyled components carry no scope attribute');
-assert(shellOpen().includes('[data-rosefd-c="index"] .rcard'), 'the streamed shell inlines the scoped styles');
-assert(buildShell(home.html, home.state, null, []).includes('<style>[data-rosefd-c='), 'the buffered shell inlines the scoped styles');
+// Route <style> never rides the shell: the streamed document carries it inline
+// in the body (head markers - first paint without FOUC), the buffered one in
+// <head> through the route's head blocks.
+assert(doc.includes('[data-rosefd-c="index"] .rcard'), 'the streamed document inlines the scoped styles in the body');
+assert(getHtmlShell(home.html, home.state, home.head).includes('[data-rosefd-c="index"] .rcard'), 'the buffered document carries the scoped styles in <head>');
+assert(!shellOpen().includes('.rcard'), 'the shell open itself carries no route styles');
 
 (globalThis as any).location = { pathname: '/about' };
 await start(appEl, '/about', false);
@@ -533,7 +565,7 @@ assert(!clientSrc.includes('api/hello'), 'the api route never enters the client 
 const lifeAbout = await renderPage('/about');
 assert(JSON.parse(lifeAbout.state).ticks === 0, 'the server render never mounts (ticks stay 0)');
 assert(lifeAbout.html.includes('mount ticks'), 'the about page renders the lifecycle demo');
-const rt = await import('./src/runtime/index.js');
+const rt = await import('../src/runtime/index.js');
 const order: string[] = [];
 rt.onMount(() => order.push('a'));
 rt.onMount(() => order.push('b'));
@@ -563,7 +595,7 @@ try {
   await start(appEl, '/about', false);
   assert(ticksOf() === 0, 'a fresh mount restarts the heartbeat from 0');
   const startedBeforePrefetch = intervalsStarted;
-  const { prefetch } = await import('./dist/client.js') as any;
+  const { prefetch } = await import('../dist/client.js') as any;
   prefetch('/about');
   await tick();
   await tick();
@@ -578,7 +610,7 @@ try {
   (globalThis as any).clearInterval = realClearInterval;
 }
 
-const serverMod = await import('./dist/server.js');
+const serverMod = await import('../dist/server.js');
 assert(typeof (serverMod as any).middleware === 'function', 'the server bundle exports the middleware handler');
 assert(typeof (serverMod as any).runMiddleware === 'function', 'the server bundle exports runMiddleware');
 assert((serverMod as any).dynamicRoutes.includes('/admin'), 'a ctx-reading route is marked dynamic');
@@ -665,7 +697,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   const jsDoc = getHtmlShell(homeDoc.html, homeDoc.state, homeDoc.head, homeDoc.csr !== false);
   if (false) assert(jsDoc.includes('__rosefd_state') && jsDoc.includes('__rosefd_handlers'), 'a normal route still inlines the state script and the bundle');
   assert(clientSrc.includes('The Garden'), 'the no-JS route render function still rides in the client bundle');
-  const { compileComponent } = await import('./src/compiler/index.js');
+  const { compileComponent } = await import('../src/compiler/index.js');
   const { writeFileSync, unlinkSync } = await import('fs');
   const { tmpdir } = await import('os');
   const { join } = await import('path');
@@ -734,7 +766,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   assert(nested.ssr.includes('const [n, setN] = state("n", 0)'), 'the top-level declaration beside it is still spliced in place');
   const tdzState = await compiledThorn('<script>\nlet n = $state(0);\nconst start = n();\n</script>\n<p>{start}</p>\n');
   assert(tdzState.ssr.indexOf('const [n, setN] = state("n"') < tdzState.ssr.indexOf('const start = n()'), 'a top-level $state read also lands after its declaration');
-  const { RoseError } = await import('./src/compiler/index.js');
+  const { RoseError } = await import('../src/compiler/index.js');
   let caught: unknown;
   try {
     await compiledThorn('<script>\nexport const vitals = "yes";\nlet n = $state(0);\n</script>\n<p>{n()}</p>\n');
@@ -744,7 +776,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   assert((caught as InstanceType<typeof RoseError>).line === 1, 'the RoseError carries the line the bad export sits on');
   assert((caught as InstanceType<typeof RoseError>).hint !== undefined, 'the RoseError carries the fix');
   type ThornResult = Awaited<ReturnType<typeof compiledThorn>>;
-  const { buildReport } = await import('./src/compiler/index.js');
+  const { buildReport } = await import('../src/compiler/index.js');
   const reportInfos = [
     { filePath: 'pages/_layout.rose', routePath: '', pattern: '', paramNames: [], isLayout: true, isNotFound: false, isError: false, isApi: false, isMiddleware: false },
     { filePath: 'pages/plain.rose', routePath: '/plain', pattern: '/plain', paramNames: [], isLayout: false, isNotFound: false, isError: false, isApi: false, isMiddleware: false },
@@ -761,7 +793,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   assert(report.length === 2, 'the report lists the routes only (layouts and the 404 page are not routes)');
   assert(report[0].includes('/plain') && report[0].includes('client JS') && report[0].includes('refresh() in _layout.rose'), `a route under a needy layout blames the layout (got: ${report[0]})`);
   assert(report[1].includes('/loud') && report[1].includes('event wiring (on:) in loud.rose'), `a needy route blames its own component (got: ${report[1]})`);
-  const { loadPlugins } = await import('./src/compiler/index.js');
+  const { loadPlugins } = await import('../src/compiler/index.js');
   assert((await loadPlugins(tmpdir())).length === 0, 'a project with no rosefd.config.js loads no plugins');
   const pluginFile = join(tmpdir(), 'rosefd-plugin.rose');
   writeFileSync(pluginFile, '<script>\nlet p = $data(async () => "x");\n</script>\n<p>{p()}</p>');
@@ -790,7 +822,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   if (false) assert(csp.includes(`'sha256-${hash}'`), 'the strict CSP hashes the exact inlined script bytes (the page runs, nothing else does)');
   if (false) assert(csp.includes("style-src 'unsafe-inline'") && csp.includes("object-src 'none'"), 'the policy still allows the inline styles and locks the rest down');
   if (false) assert(!/x-robots-tag/.test(clientSrc), 'per-route headers never reach the client bundle');
-  const { compileComponent } = await import('./src/compiler/index.js');
+  const { compileComponent } = await import('../src/compiler/index.js');
   const { writeFileSync, unlinkSync } = await import('fs');
   const { tmpdir } = await import('os');
   const { join } = await import('path');
@@ -818,7 +850,10 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   assert(zh.head.join('').includes('<title>关于,已本地化 - Rose Frame Driver</title>'), '$t works in the route <head> (zh)');
   assert(stripMarkers(en.html).includes('Current language: en'), 'the [lang] param arrives as state (en)');
   assert(stripMarkers(zh.html).includes('当前语言: zh'), 'the [lang] param arrives as state (zh)');
-  assert(JSON.parse(en.state).lang === 'en' && JSON.parse(zh.state).lang === 'zh', 'the locale rides in the serialized state');
+  // Both localized pages are auto zero-JS: the [lang] param seeding shows up
+  // in the rendered HTML (asserted above), and a zero-JS document carries no
+  // serialized state at all.
+  assert(en.state === '{}' && zh.state === '{}', 'zero-JS localized pages carry no serialized state');
   assert(en.csr === false && zh.csr === false, 'localized content pages are auto zero-JS');
   const fr = await renderPage('/fr/about');
   assert(fr.status === 404, 'an unknown locale answers 404');
@@ -848,7 +883,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   assert(icuText(ar).includes('توقيع واحد في سجل الزوار'), 'the Arabic one arm renders');
   assert(icuText(ar).includes('لا توقيعات بعد في سجل الزوار'), 'the Arabic =0 arm renders');
   {
-    const rt = await import('./src/runtime/index.js');
+    const rt = await import('../src/runtime/index.js');
     rt.setLocales({ en: { bad: '{count, plural, one {# item}}', ok: '{count, plural, one {# item} other {# items}}' } }, 'en');
     assert(rt.$t('bad', { count: 1 }) === '{count, plural, one {# item}}', 'a plural with no other arm renders verbatim');
     assert(rt.$t('ok', { count: 1 }) === '1 item', 'a well-formed one arm still expands');
@@ -887,8 +922,8 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   const { tmpdir } = await import('os');
   const { join } = await import('path');
   const { pathToFileURL } = await import('url');
-  const { buildProject, compileComponent } = await import('./src/compiler/index.js');
-  const { setBundleMode } = await import('./src/cli/shell.js');
+  const { buildProject, compileComponent } = await import('../src/compiler/index.js');
+  const { setBundleMode } = await import('../src/cli/shell.js');
 
   const pages = (mode: string) => ({
     '_layout.rose': `<script>\n  export const bundle = '${mode}';\n</script>\n\n<header><a href="/">Gate</a> <a href="/about">About</a></header>\n<slot />`,
@@ -939,11 +974,14 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
 
   setBundleMode('split');
   const splitDoc = getHtmlShell('<p>split body</p>', '{"__route":"/"}', []);
-  assert(splitDoc.includes('<script type="module" src="/client.js"></script>'), 'the split document references /client.js externally');
+  // The external reference is content-versioned (/client.js?v=<hash>) so a
+  // deploy is a new URL, and fetchpriority=high so it starts before the
+  // inline bootstrap finishes parsing.
+  assert(/<script type="module" src="\/client\.js(?:\?v=[0-9a-z]+)?" fetchpriority="high">/.test(splitDoc), 'the split document references /client.js externally');
   assert(!/matchRoute/.test(splitDoc), 'the bundle is NOT inlined into the split document (no runtime code in the HTML)');
   assert(splitDoc.length < 4800, `the split document stays small (${splitDoc.length} bytes - the bundle is not in it; the bootstrap grows with shell features, the bundle would add 10KB+)`);
   const splitBlocks = [...splitDoc.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  const splitBoot = splitBlocks.find((b) => b.includes("from '/client.js'"))!;
+  const splitBoot = splitBlocks.find((b) => b.includes("from '/client.js"))!;
   const splitHash = createHash('sha256').update(splitBoot, 'utf-8').digest('base64');
   const splitCsp = securityHeaders(null)['Content-Security-Policy'];
   assert(splitCsp.includes(`'sha256-${splitHash}'`) && splitCsp.includes("'self'"), "split mode's CSP hashes the inline bootstrap and admits the external modules - still no 'unsafe-inline'");
@@ -1010,7 +1048,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   const { tmpdir } = await import('os');
   const { join } = await import('path');
   const { pathToFileURL } = await import('url');
-  const { buildProject } = await import('./src/compiler/index.js');
+  const { buildProject } = await import('../src/compiler/index.js');
 
   const root = join(tmpdir(), 'rosefd-compfix');
   rmSync(root, { recursive: true, force: true });
@@ -1120,7 +1158,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   const { tmpdir } = await import('os');
   const { join } = await import('path');
   const { pathToFileURL } = await import('url');
-  const { buildProject } = await import('./src/compiler/index.js');
+  const { buildProject } = await import('../src/compiler/index.js');
 
   const root = join(tmpdir(), 'rosefd-nestfix');
   rmSync(root, { recursive: true, force: true });

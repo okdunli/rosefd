@@ -74,6 +74,26 @@ assert(failed.err.includes('no .rose pages found'), 'the failure says what is wr
 assert(failed.err.includes(path.join(bare, 'src', 'pages')), 'the failure names the directory it looked in');
 assert(failed.err.includes('rosefd build <dir>'), 'the failure names the fix');
 
+// The bundle mode is an app-level switch: a leaf page exporting it used to
+// silently flip every document to the external-runtime mode.
+const bundleLeaf = path.join(tmp, 'bundle-leaf');
+fs.mkdirSync(path.join(bundleLeaf, 'src', 'pages'), { recursive: true });
+fs.writeFileSync(path.join(bundleLeaf, 'src', 'pages', 'index.rose'), '<h1>home</h1>\n');
+fs.writeFileSync(path.join(bundleLeaf, 'src', 'pages', 'leaf.rose'), "<script>\n  export const bundle = 'split';\n</script>\n<h1>leaf</h1>\n");
+const leafFailed = await run(['build', bundleLeaf], REPO);
+assert(leafFailed.code !== 0, 'a leaf page exporting bundle fails the build (the mode is per-app)');
+assert(leafFailed.err.includes('leaf.rose') && leafFailed.err.includes('_layout.rose'), 'the failure names the file and the right place for the export');
+
+const bundleRoot = path.join(tmp, 'bundle-root');
+fs.mkdirSync(path.join(bundleRoot, 'src', 'pages'), { recursive: true });
+fs.writeFileSync(path.join(bundleRoot, 'src', 'pages', 'index.rose'), "<script>\n  let n = $state(0);\n  function bump() { $setState('n', n() + 1); }\n</script>\n<h1>home</h1>\n<button on:click={bump}>bump</button>\n<p>{n}</p>\n");
+fs.writeFileSync(path.join(bundleRoot, 'src', 'pages', '_layout.rose'), "<script>\n  export const bundle = 'split';\n</script>\n<main>{children}</main>\n");
+const rootBuilt = await run(['build', bundleRoot], REPO);
+assert(rootBuilt.code === 0, `the root layout exporting bundle builds (stderr: ${rootBuilt.err.slice(0, 200)})`);
+const rootHome = path.join(REPO, 'dist', 'index.html');
+assert(/modulepreload[^>]+client\.js\?v=/.test(fs.readFileSync(rootHome, 'utf-8')), 'split mode from the root layout emits the external runtime reference');
+assert(fs.existsSync(path.join(REPO, 'dist', 'chunks')), 'split mode emits route chunks');
+
 const usage = await run([], REPO);
 assert(usage.out.includes('[dir]') && usage.out.includes('current directory'), 'the usage line documents the dir argument and its default');
 
@@ -286,6 +306,71 @@ assert(tBuilt.code === 0, 'a transform-only project builds');
 const tServer = fs.readFileSync(path.join(tOnly, 'dist', 'server.js'), 'utf8');
 assert(!tServer.includes('marker-transform-only'), 'a transform-only config is NOT bundled into the server (no runtime hook, no config import)');
 assert(tServer.includes('runRequestHooks'), 'the no-op runners are still exported, so the servers call them unconditionally');
+
+const plugCache = path.join(tmp, 'plugcache');
+fs.mkdirSync(path.join(plugCache, 'src', 'pages'), { recursive: true });
+const plugCounter = path.join(plugCache, 'calls.log');
+const plugSrc = (marker) => `import { appendFileSync } from 'node:fs';\nconst counter = ${JSON.stringify(plugCounter)};\nexport default [{ name: 'marker-cache', transform(code) { appendFileSync(counter, 'x'); return code.replaceAll('MARKER', '${marker}'); } }];\n`;
+fs.writeFileSync(path.join(plugCache, 'my-plugin.mjs'), plugSrc('PLUGINIZED'));
+fs.writeFileSync(path.join(plugCache, 'rosefd.config.js'), `export { default } from './my-plugin.mjs';\n`);
+fs.writeFileSync(path.join(plugCache, 'src', 'pages', 'index.rose'), `<p>MARKER page</p>\n`);
+const pc1 = await run(['build'], plugCache);
+assert(pc1.code === 0, `a transform-plugin project builds (stderr: ${pc1.err.slice(0, 200)})`);
+assert(fs.readFileSync(path.join(plugCache, 'dist', 'index.html'), 'utf8').includes('PLUGINIZED'), 'the plugin transform lands in the built page');
+const callsAfterCold = fs.existsSync(plugCounter) ? fs.readFileSync(plugCounter, 'utf8').length : 0;
+assert(callsAfterCold >= 1, 'the transform ran on the cold build');
+const pc2 = await run(['build'], plugCache);
+assert(pc2.code === 0, 'the transform-plugin project rebuilds');
+assert(fs.readFileSync(path.join(plugCache, 'dist', 'index.html'), 'utf8').includes('PLUGINIZED'), 'the cached result still carries the transform (no stale pre-plugin output)');
+const callsAfterWarm = fs.existsSync(plugCounter) ? fs.readFileSync(plugCounter, 'utf8').length : 0;
+assert(callsAfterWarm === callsAfterCold, 'the rebuild hit the compile cache: the transform did not run again (plugin projects are cached too)');
+fs.writeFileSync(path.join(plugCache, 'my-plugin.mjs'), plugSrc('PLUGINIZED2'));
+const pc3 = await run(['build'], plugCache);
+assert(pc3.code === 0, 'the project rebuilds after the plugin changed');
+assert(fs.readFileSync(path.join(plugCache, 'dist', 'index.html'), 'utf8').includes('PLUGINIZED2'), 'editing the plugin transform invalidates the cache (the new transform lands)');
+
+{
+  const dbDir = path.join(tmp, 'doublebuild');
+  fs.mkdirSync(path.join(dbDir, 'src', 'pages'), { recursive: true });
+  fs.writeFileSync(path.join(dbDir, 'src', 'pages', 'index.rose'), `<p>db-marker</p>\n`);
+  fs.writeFileSync(path.join(dbDir, 'src', 'pages', 'two.rose'), `<p>second page</p>\n`);
+  const dbOut = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [path.join(REPO, 'node_modules/tsx/dist/cli.mjs'), path.join(REPO, 'tests', 'double-build.mts'), dbDir], { cwd: REPO });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (c) => { out += c; });
+    p.stderr.on('data', (c) => { err += c; });
+    p.on('close', (code) => resolve({ code, out, err }));
+  });
+  assert(dbOut.code === 0, `the in-process double build runs (stderr: ${dbOut.err.slice(0, 200)})`);
+  const db = JSON.parse(dbOut.out.trim().split('\n').pop());
+  assert(db.mtimeAfterFirst > 0, 'the first build wrote the intermediates');
+  assert(db.mtimeAfterSecond === db.mtimeAfterFirst, 'the hot rebuild left unchanged intermediates untouched (no rewrite, same mtime)');
+  assert(db.serverUnchanged, 'the hot rebuild still produced the identical server bundle (the skip never serves stale bytes)');
+}
+
+{
+  const prDir = path.join(tmp, 'prerender-skip');
+  fs.mkdirSync(path.join(prDir, 'src', 'pages'), { recursive: true });
+  fs.writeFileSync(path.join(prDir, 'src', 'pages', 'index.rose'), `<p>pr-marker</p>\n`);
+  fs.writeFileSync(path.join(prDir, 'src', 'pages', 'gone.rose'), `<p>will be deleted</p>\n`);
+  const pr1 = await run(['build'], prDir);
+  assert(pr1.code === 0, 'the prune-skip fixture builds');
+  const prHome = path.join(prDir, 'dist', 'index.html');
+  assert(fs.existsSync(prHome) && fs.readFileSync(prHome, 'utf8').includes('pr-marker'), 'the home route prerendered');
+  const prGone = path.join(prDir, 'dist', 'gone', 'index.html');
+  assert(fs.existsSync(prGone), 'the second route prerendered');
+  const prMtime = fs.statSync(prHome).mtimeMs;
+  await new Promise((r) => setTimeout(r, 25));
+  const pr2 = await run(['build'], prDir);
+  assert(pr2.code === 0, 'the fixture rebuilds');
+  assert(fs.statSync(prHome).mtimeMs === prMtime, 'an unchanged route was not rewritten (the prune no longer deletes what the write pass recreates)');
+  assert(fs.readFileSync(prHome, 'utf8').includes('pr-marker'), 'the skipped route still carries its content');
+  fs.rmSync(path.join(prDir, 'src', 'pages', 'gone.rose'));
+  const pr3 = await run(['build'], prDir);
+  assert(pr3.code === 0, 'the fixture rebuilds after a route was removed');
+  assert(!fs.existsSync(prGone), "a removed route's prerendered file is pruned (no stale page served)");
+}
 
 const compsDir = path.join(tmp, 'comps');
 fs.mkdirSync(path.join(compsDir, 'src', 'components', 'ui'), { recursive: true });
@@ -972,6 +1057,11 @@ assert(!/Cannot access|before initialization/.test(tdzBuilt.err), 'the build rep
 const tdzHtml = fs.readFileSync(path.join(tdzDir, 'dist', 'index.html'), 'utf8');
 assert(!/render failed/i.test(tdzHtml), 'the page is not the error page');
 assert(/<p><!--⟦m:0⟧-->1<\/p>/.test(tdzHtml), 'the top-level read renders the state value (declaration first, read after)');
+// The textual assertions below read compiler output: minification renames
+// locals, so they run against a --no-minify build (the functional checks
+// above already proved the minified bundle renders identically).
+const tdzDebug = await run(['build', '--no-minify'], tdzDir);
+assert(tdzDebug.code === 0, `the same page builds unminified (stderr: ${tdzDebug.err.slice(0, 200)})`);
 const tdzServer = fs.readFileSync(path.join(tdzDir, 'dist', 'server.js'), 'utf8');
 const declAt = tdzServer.indexOf('const [st, setSt] = state("st"');
 const readAt = tdzServer.indexOf('const counts = st().counts');
@@ -996,7 +1086,7 @@ fs.writeFileSync(path.join(tdzDir, 'src', 'pages', 'nested.rose'), `<script>
 </script>
 <p>{n()}</p>
 `);
-const nestedBuilt = await run(['build'], tdzDir);
+const nestedBuilt = await run(['build', '--no-minify'], tdzDir);
 assert(nestedBuilt.code === 0, `a declaration inside onMount still builds (stderr: ${nestedBuilt.err.slice(0, 200)})`);
 const nestedHtml = fs.readFileSync(path.join(tdzDir, 'dist', 'nested', 'index.html'), 'utf8');
 assert(/<p><!--⟦m:0⟧-->0<\/p>/.test(nestedHtml), 'the page with the nested declaration renders');
@@ -1101,7 +1191,7 @@ fs.writeFileSync(path.join(mntDir, 'src', 'pages', 'plain.rose'), `<h1>Plain mou
 const mntBuilt = await run(['build'], mntDir);
 assert(mntBuilt.code === 0, `the mount fixture project builds (stderr: ${mntBuilt.err.slice(0, 200)})`);
 const mountSrc = fs.readFileSync(path.join(mntDir, 'dist', 'mount.js'), 'utf8');
-assert(mountSrc.includes('[data-rosefd]') && /from '\/client\.js'/.test(mountSrc), 'the build emits dist/mount.js (the embeddable entry)');
+assert(mountSrc.includes('[data-rosefd]') && /from '\/client\.js(\?v=[0-9a-z]+)?'/.test(mountSrc), 'the build emits dist/mount.js (the embeddable entry)');
 const mntPort = await takePort(0);
 const mntProc = spawn(process.execPath, [...TSX, 'serve'], {
   cwd: mntDir,
@@ -1120,7 +1210,7 @@ try {
     const decls = exp[1].split(',').map((s) => { const [o, a] = s.split(/\s+as\s+/); return `${a || o}=${o}`; }).join(',');
     client = client.replace(exp[0], `const ${decls};`);
   }
-  const mountBody = mountSrc.replace(/^import \{[^}]*\} from '\/client\.js';$/m, '');
+  const mountBody = mountSrc.replace(/^import \{[^}]*\} from '\/client\.js(\?v=[0-9a-z]+)?';$/m, '');
   const classic = `${client}\n;(async () => {\n${mountBody}\n})();`;
   const requests = [];
   let hostPrevented = true;
@@ -1184,6 +1274,39 @@ try {
  } finally {
    mntProc.kill();
  }
+}
+
+{
+  const isoScratch = fs.mkdtempSync(path.join(process.env.TEMP || '/tmp', 'rosefd-isolate-'));
+  fs.writeFileSync(path.join(isoScratch, 'runner.mjs'), `
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { pathToFileURL } from 'node:url';
+const RT = await import(pathToFileURL(${JSON.stringify(path.join(REPO, 'src/runtime/index.ts'))}).href);
+const als = new AsyncLocalStorage();
+RT.installContextStore({ getStore: () => als.getStore(), run: (s, fn) => als.run(s, fn) });
+const render = (name, delay) => als.run({}, () => RT.isolateRender(async () => {
+  RT.setState('route', name);
+  await new Promise((r) => setTimeout(r, delay));
+  RT.setState('afterAwait', name);
+  return JSON.parse(RT.serializeState());
+}));
+const [a, b] = await Promise.all([render('A', 5), render('B', 30)]);
+console.log(JSON.stringify({ a, b, leak: RT.hasState('route') }));
+`);
+  const isoRun = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [path.join(REPO, 'node_modules/tsx/dist/cli.mjs'), path.join(isoScratch, 'runner.mjs')], { cwd: isoScratch });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (c) => { out += c; });
+    p.stderr.on('data', (c) => { err += c; });
+    p.on('close', (code) => resolve({ code, out, err }));
+  });
+  fs.rmSync(isoScratch, { recursive: true, force: true });
+  assert(isoRun.code === 0, `the isolation runner loads the runtime (stderr: ${isoRun.err.slice(-300)})`);
+  const iso = JSON.parse(isoRun.out.trim());
+  assert(iso.a.route === 'A' && iso.a.afterAwait === 'A', `an overlapping render keeps its own state across awaits (got ${JSON.stringify(iso.a)})`);
+  assert(iso.b.route === 'B' && iso.b.afterAwait === 'B', `the second overlapping render is not wiped by the first one's restore (got ${JSON.stringify(iso.b)})`);
+  assert(iso.leak === false, 'no render state survives into the process-wide map');
 }
 
 {
@@ -1740,7 +1863,8 @@ export default [{
   assert(panel.includes('setInterval(read, 1000)'), 'the panel refreshes once a second');
   const panelHtml = fs.readFileSync(path.join(dt, 'panel.html'), 'utf8');
   assert(panelHtml.includes('panel.js') && /Signal graph/.test(panelHtml) && /Prefetch/.test(panelHtml), 'the panel page mounts the script and names both sections');
-  assert(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8').includes('"devtools"'), 'the npm package ships the extension (files)');
+  const pkgFiles = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).files;
+  assert(pkgFiles.includes('devtools') || pkgFiles.some((f) => f.startsWith('devtools/')), 'the npm package ships the extension (files)');
 }
 
 {

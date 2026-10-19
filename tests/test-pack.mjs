@@ -97,7 +97,7 @@ const consumer = path.join(project, 'consumer.mjs');
 fs.writeFileSync(consumer, `
 import { createEdgeHandler } from 'rosefd/edge';
 import { fileURLToPath } from 'node:url';
-const handle = await createEdgeHandler(fileURLToPath(new URL('../dist', import.meta.url)));
+const handle = await createEdgeHandler(fileURLToPath(new URL('./dist', import.meta.url)));
 const home = await handle(new Request('http://localhost/'));
 const body = await home.text();
 const missing = await handle(new Request('http://localhost/api/missing'));
