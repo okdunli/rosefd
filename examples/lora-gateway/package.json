@@ -1,0 +1,14 @@
+{
+  "name": "rosefd-lora-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rosefd dev",
+    "build": "rosefd build",
+    "preview": "rosefd preview",
+    "serve": "rosefd serve"
+  },
+  "dependencies": {
+    "rosefd": "latest"
+  }
+}
