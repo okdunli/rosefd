@@ -5,9 +5,25 @@ import * as path from 'path';
 import * as os from 'os';
 import { pathToFileURL, fileURLToPath } from 'url';
 import * as esbuild from 'esbuild';
+
+// A dev hot-rebuild reuses an esbuild build context so a one-file edit only
+// rebundles the changed module instead of re-walking the whole graph (the warm
+// rebuild used to cost as much as the cold one). esbuild 0.24 dropped the old
+// `incremental` flag for the context() API; one-shot builds (production) skip
+// the cache so the context never holds the service open and hangs process exit.
+const __esbuildCache = new Map<string, esbuild.BuildContext>();
+function runEsbuild(key: string, opts: esbuild.BuildOptions, incremental: boolean): Promise<esbuild.BuildResult> {
+  // esbuild.context() cannot be used with code splitting (outdir+splitting); fall back to a plain one-shot build there.
+  if (!incremental || opts.splitting) return esbuild.build(opts);
+  const ex = __esbuildCache.get(key);
+  if (ex) return ex.rebuild().catch((e) => { __esbuildCache.delete(key); throw e; });
+  return esbuild.context(opts).then((c) => { __esbuildCache.set(key, c); return c.rebuild(); });
+}
 // The error contract every compiler failure speaks: a stable code, the file, the line when known.
 import { RoseError, lineOf, lineAt } from './errors.js';
-export { RoseError, lineOf, lineAt, errorInfo } from './errors.js';
+import { rmTreeParallel, sweepStaleBuildDirs } from './rm-fast.js';
+import { fnv1a32 } from '../hash.js';
+export { RoseError, lineOf, lineAt, errorInfo, codeFrame } from './errors.js';
 export type { RoseErrorInfo } from './errors.js';
 import type { PwaOptions } from '../pwa.js';
 
@@ -52,6 +68,8 @@ export interface CompileResult {
   hasPrerender?: boolean;
   /** the component reads the request context (getContext()): it is dynamic */
   usesContext?: boolean;
+  /** the component references a shared $store() - the app opts into the live store channel */
+  usesStore?: boolean;
   revalidate?: number;
   cache?: number;
   csr?: boolean;
@@ -78,6 +96,8 @@ export interface CompileResult {
    */
   controlSignal?: boolean;
   prefetch?: string;
+  /** app-global hydration strategy: defer the initial wire() to requestIdleCallback (lazy hydration / partial resumability) */
+  lazyHydration?: boolean;
   vitals?: boolean;
   bundle?: string;
  /** The static analysis says this component needs the client bundle */
@@ -98,7 +118,7 @@ export interface CompileResult {
    */
   cspNonce?: boolean;
   /** a route's script references globalThis.__rosefdAuth - emit the node:crypto auth helpers */
-  usesRose Frame DriverAuth?: boolean;
+  usesRoseFdAuth?: boolean;
   /**
    * A prop is a plain value the caller passes per invocation (never a
    * signal: the parent re-renders the child when a prop changes), so it is
@@ -147,8 +167,17 @@ interface Decl {
  * keeping the original exclusions: not after [\w$.] (property access) and not
  * before [\w$:(] (call, declaration, or object key).
  */
-function callifyStateReads(script: string, names: string[]): string {
-  if (names.length === 0) return script;
+/**
+ * The same bare-read rewrite with an optional RENAME map: a matched
+ * identifier becomes `${rename[word]}()` instead of `${word}()`. The const
+ * pass uses it to point uses at the internal thunk name. Rename wins over
+ * callify when both could match - a {@const} that shadows a signal must
+ * resolve to the const, not the signal. The position rules are shared, so a
+ * property access, a call, a declaration, or an object key is never touched
+ * by either.
+ */
+function callifyStateReads(script: string, names: string[], rename?: Record<string, string>): string {
+  if (names.length === 0 && !rename) return script;
   const scan = (src: string): string => {
     let out = '';
     let i = 0;
@@ -215,10 +244,10 @@ function callifyStateReads(script: string, names: string[]): string {
         const word = src.slice(i, j);
         const prev = out.length ? out[out.length - 1] : '';
         const next = src[j] ?? '';
-        const rewrite = names.includes(word)
-          && !/[\w$.]/.test(prev)
-          && !/[\w$:(]/.test(next);
-        out += rewrite ? `${word}()` : word;
+        const bare = !/[\w$.]/.test(prev) && !/[\w$:(]/.test(next);
+        const rewrite = bare && names.includes(word);
+        const renamed = bare && rename != null && Object.prototype.hasOwnProperty.call(rename, word);
+        out += rewrite ? `${word}()` : renamed ? `${rename[word]}()` : word;
         i = j;
         continue;
       }
@@ -232,14 +261,264 @@ function callifyStateReads(script: string, names: string[]): string {
 
 /**
  * the same bare-read rewrite, and nothing else does. A whole-template scan
- * "likes()" - so the pass walks expressions only. Block syntax ({#if …},
+ * "likes()" - so the pass walks expressions only.
+ *
+ * The walk is also where {@const} scoping lives, for BOTH passes that use
+ * this function:
+ *
+ * - the state pass (compileComponent) must stop calling a signal whose name
+ *   a const shadows - a use site after the declaration belongs to the const,
+ *   and the const pass rewrites it to the internal thunk;
+ * - the const pass (compileTemplate) must stop renaming a name once a NESTED
+ *   declaration shadows the const it is rewriting - the inner const's own
+ *   pass owns the uses that follow it.
+ *
+ * A declaration is processed with the shadow set as it stands BEFORE the
+ * name joins it: the initializer still sees the outer binding, which is what
+ * makes {@const total = total() * 2} shadow instead of self-recurse.
+ *
+ * Block syntax is NOT skipped: the expanders that run after the state pass
+ * (expandIfElse, expandAwaitBlocks, …) parse conditions straight out of this
+ * text, so a `{:else}` whose condition still reads `show` would compile to
+ * `{#if !(show)}` - a dead branch, because autoCall only calls a BARE name.
+ * Block spans therefore go through the same rewrite as any other span; the
+ * scope stack is what separates them.
+ *
+ * Blocks also INTRODUCE bindings, and those shadow outer names exactly like
+ * a const does: the each item/index (and every name in a destructuring
+ * pattern), the snippet parameters, the {:then}/{:catch} variable. Their
+ * names are declarations, not use sites - rewriting one used to shatter the
+ * head itself ({#each rows as name} became {#each rows as name()}, which
+ * fails the build) and to hijack the body's uses. The head is therefore
+ * split: the ITEMS expression is rewritten against the enclosing scope,
+ * the bindings are copied verbatim and join the new scope, and a keyed
+ * each's key - evaluated inside the block, where the item shadows - is
+ * rewritten after the scope opens.
  */
-function callifyTemplateExprs(template: string, names: string[]): string {
-  if (names.length === 0) return template;
+const BLOCK_OPEN_RE = /^\s*#(?:if|each|await|key|snippet|boundary|island|defer)\b/;
+const BLOCK_CLOSE_RE = /^\s*\/(?:if|each|await|key|snippet|boundary|island|defer)\s*$/;
+const ELSE_BRANCH_RE = /^\s*:(?:else|then|catch|fallback)\b/;
+// Head shapes mirrored from parseBlockHead, so this pass and the block
+// machinery always agree on where the bindings are.
+const EACH_HEAD_RE = /^\s*#each\s+([\s\S]+?)\s+as\s+(\{[^{}]*\}|\[[^[\]]*\]|\w+)(?:\s*,\s*(\w+))?(?:\s*\(([\s\S]+)\))?\s*$/;
+const SNIPPET_HEAD_RE = /^\s*#snippet\s+(\w+)(?:\s*\(([\s\S]*)\))?\s*$/;
+const THEN_VAR_RE = /^\s*:(?:then|catch)\s+([A-Za-z_$][\w$]*)\s*$/;
+
+/**
+ * The bound names of a destructuring pattern ({a, b} / [a, b]), a parameter
+ * list (a, b = 1), or a plain identifier. A property key before a colon is
+ * NOT a binding - {name: alias} binds alias. Junk parts (a default value
+ * with a comma inside) filter out instead of poisoning the shadow set.
+ */
+function bindingNames(pat: string): string[] {
+  const inner = pat.replace(/^[{[]/, '').replace(/[}\]]$/, '');
+  return inner.split(',').map((part) => {
+    const noDefault = part.split('=')[0].trim();
+    const colon = noDefault.indexOf(':');
+    return colon >= 0 ? noDefault.slice(colon + 1).trim() : noDefault;
+  }).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
+}
+
+/**
+ * The [start, end) text ranges of every component's CHILDREN - the default
+ * slot plus every named slot. compileTemplate compiles those through a
+ * recursive call, so they are a scope boundary exactly like a block: a
+ * {@const} declared there belongs to THAT call's scope. A scope-aware pass
+ * that collected or rewrote it here would rename its uses to a thunk this
+ * scope never emits - a ReferenceError at render time, the worst failure
+ * mode a template compiler has (a wrong page, no build error).
+ *
+ * Ranges are disjoint and ordered: the scan skips past each component whole,
+ * so a component nested inside another's children is covered by the outer
+ * range. Same tag scanner the compile loop uses (findCompTag/findClose), so
+ * the two always agree on where a component's children start and end.
+ */
+function compChildrenRanges(template: string, comps: Map<string, unknown>): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  let base = 0;
+  while (base < template.length) {
+    const tag = findCompTag(template.slice(base), comps);
+    if (!tag) break;
+    if (tag.selfClosing) {
+      base += tag.end;
+      continue;
+    }
+    const close = findClose(template, base + tag.end, tag.name);
+    const end = close >= 0 ? close + tag.name.length + 3 : template.length;
+    ranges.push([base + tag.start, end]);
+    base = end;
+  }
+  return ranges;
+}
+
+/**
+ * The {@const} names declared at THIS scope level of a template (nested
+ * blocks' and components' declarations excluded - they belong to the
+ * recursive call that compiles their body). Same block-boundary shapes
+ * callifyTemplateExprs walks, plus the component-children ranges, so the two
+ * always agree on where a scope ends.
+ *
+ * compileTemplate uses it to assign every const of the scope its internal
+ * thunk name in ONE upfront pass, instead of re-walking the whole remaining
+ * template per declaration - the old per-const pass made a template with C
+ * consts cost O(C x template). Each name is declared once per scope (a
+ * second one is a build error, R43), so a flat name -> thunk map is exact.
+ */
+function scopeConstNames(template: string, comps: Map<string, unknown>): string[] {
+  const names: string[] = [];
+  let depth = 0;
+  const ranges = comps.size > 0 ? compChildrenRanges(template, comps) : [];
+  let ri = 0;
+  let rangeEnd = -1;
+  for (const s of templateExprSpans(template)) {
+    while (ri < ranges.length && ranges[ri][0] <= s.start) rangeEnd = ranges[ri++][1];
+    // Inside a component's children: that scope's const, not ours.
+    if (s.start < rangeEnd) continue;
+    const expr = s.expr;
+    if (BLOCK_CLOSE_RE.test(expr)) {
+      if (depth > 0) depth--;
+      continue;
+    }
+    if (BLOCK_OPEN_RE.test(expr)) {
+      depth++;
+      continue;
+    }
+    if (ELSE_BRANCH_RE.test(expr)) continue;
+    if (depth === 0) {
+      const m = /^\s*@const\s+([A-Za-z_$][\w$]*)\s*=/.exec(expr);
+      if (m) names.push(m[1]);
+    }
+  }
+  return names;
+}
+
+function callifyTemplateExprs(
+  template: string,
+  names: string[],
+  rename?: Record<string, string>,
+  opts?: { ownScope?: boolean; comps?: Map<string, unknown> }
+): string {
+  if (names.length === 0 && !rename) return template;
   let out = '';
   let last = 0;
+  // One entry per open block; the root scope holds top-level declarations. A
+  // name is shadowed while ANY enclosing scope has declared it, so the stack
+  // gives the lexical answer without a real parser.
+  const scopes: Array<Set<string>> = [new Set<string>()];
+  const top = (): Set<string> => scopes[scopes.length - 1];
+  const shadowed = (n: string): boolean => scopes.some((s) => s.has(n));
+  // The const pass (ownScope) renames a use only when the NEAREST enclosing
+  // declaration of the name is THIS scope's: it walks the whole template
+  // including the declaration itself, so "not shadowed anywhere" would skip
+  // every use that follows a declaration - the exact opposite of the answer.
+  // A nested block's or component's own declaration takes over from its
+  // point on, and the recursive compileTemplate call that compiles that body
+  // rewrites those uses with its own ids. The state pass keeps the original
+  // rule: rewrite until ANY enclosing scope declares the name.
+  const keepRename = opts?.ownScope
+    ? (k: string): boolean => {
+        for (let i = scopes.length - 1; i >= 0; i--) {
+          if (scopes[i].has(k)) return i === 0;
+        }
+        return false;
+      }
+    : (k: string): boolean => !shadowed(k);
+  const eff = (): [string[], Record<string, string> | undefined] => [
+    names.filter((n) => !shadowed(n)),
+    rename ? Object.fromEntries(Object.entries(rename).filter(([k]) => keepRename(k))) : undefined,
+  ];
+  // A component's children are compiled by a recursive call, so they bound a
+  // scope exactly like a block: push when the walk reaches the tag, pop after
+  // the matching close. Only the const pass asks for this - the state pass
+  // keeps its long-standing (pre-component-scope) behavior untouched.
+  const events: Array<{ pos: number; open: boolean }> = [];
+  if (opts?.comps && opts.comps.size > 0) {
+    for (const [a, b] of compChildrenRanges(template, opts.comps)) {
+      events.push({ pos: a, open: true });
+      events.push({ pos: b, open: false });
+    }
+  }
+  let ei = 0;
   for (const s of templateExprSpans(template)) {
-    out += template.slice(last, s.start) + '{' + callifyStateReads(s.expr, names) + '}';
+    while (ei < events.length && events[ei].pos <= s.start) {
+      if (events[ei].open) scopes.push(new Set<string>());
+      else if (scopes.length > 1) scopes.pop();
+      ei++;
+    }
+    const expr = s.expr;
+    if (BLOCK_CLOSE_RE.test(expr)) {
+      if (scopes.length > 1) scopes.pop();
+      out += template.slice(last, s.end + 1);
+      last = s.end + 1;
+      continue;
+    }
+    if (BLOCK_OPEN_RE.test(expr)) {
+      const eachM = EACH_HEAD_RE.exec(expr);
+      if (eachM) {
+        const [, items, item, index, key] = eachM;
+        const [en, er] = eff();
+        const bindings = ` as ${item}${index ? `, ${index}` : ''}`;
+        // The item (and index, and every pattern name) shadow from here to
+        // the matching {/each}; the key is evaluated inside that scope.
+        scopes.push(new Set<string>([...bindingNames(item), ...(index ? [index] : [])]));
+        const keyOut = key != null && key.trim() !== ''
+          ? ` (${callifyStateReads(key, ...eff())})`
+          : '';
+        out += template.slice(last, s.start) + `{#each ${callifyStateReads(items, en, er)}${bindings}${keyOut}}`;
+        last = s.end + 1;
+        continue;
+      }
+      const snipM = SNIPPET_HEAD_RE.exec(expr);
+      if (snipM) {
+        // A snippet head is a registry key plus bindings: nothing in it is
+        // a use site, and the params shadow inside the body.
+        scopes.push(new Set<string>(snipM[2] ? bindingNames(snipM[2]) : []));
+        out += template.slice(last, s.end + 1);
+        last = s.end + 1;
+        continue;
+      }
+      // The head is evaluated in the ENCLOSING scope, so it is rewritten
+      // before this block's own scope opens.
+      const [en, er] = eff();
+      out += template.slice(last, s.start) + '{' + callifyStateReads(expr, en, er) + '}';
+      scopes.push(new Set<string>());
+      last = s.end + 1;
+      continue;
+    }
+    if (ELSE_BRANCH_RE.test(expr)) {
+      // {:else}/{:then}/{:catch} open a sibling scope inside the same block:
+      // names the earlier branch declared do not survive into it - and an
+      // {:else if} head is likewise evaluated against the enclosing scope.
+      top().clear();
+      const thenM = THEN_VAR_RE.exec(expr);
+      if (thenM) {
+        // {:then x}/{:catch e} introduce a binding for the branch body.
+        top().add(thenM[1]);
+        out += template.slice(last, s.end + 1);
+        last = s.end + 1;
+        continue;
+      }
+      const [en, er] = eff();
+      out += template.slice(last, s.start) + '{' + callifyStateReads(expr, en, er) + '}';
+      last = s.end + 1;
+      continue;
+    }
+    const constDecl = /^\s*@const\s+([A-Za-z_$][\w$]*)\s*=([\s\S]*)$/.exec(expr);
+    const [en, er] = eff();
+    if (constDecl) {
+      // The declaration name is copied verbatim. Rewriting it is what used
+      // to shatter {@const total = total() * 2} into {@const total() = …},
+      // which the const matcher then rejected - and the same hazard applies
+      // to a rename pass walking a nested same-name declaration.
+      const init = constDecl[2];
+      const body = callifyStateReads(init, en, er);
+      top().add(constDecl[1]);
+      out += template.slice(last, s.start)
+        + (body === init ? template.slice(s.start, s.end + 1) : `{@const ${constDecl[1]} =${body}}`);
+      last = s.end + 1;
+      continue;
+    }
+    out += template.slice(last, s.start) + '{' + callifyStateReads(expr, en, er) + '}';
     last = s.end + 1;
   }
   return out + template.slice(last);
@@ -273,6 +552,25 @@ export function templateExprSpans(src: string): Array<{ start: number; end: numb
   return spans;
 }
 
+/**
+ * The FIRST expression span only, stopping at it. compileTemplate's loop
+ * asks for "the next construct" once per iteration over a shrinking
+ * `remaining`; building the whole span array there (templateExprSpans(src)[0])
+ * scanned - and allocated for - every span still ahead on every iteration,
+ * which is quadratic in the template size. Same answer, one span.
+ */
+function firstExprSpan(src: string): { start: number; end: number; expr: string } | null {
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] === '{') {
+      const end = scanExprEnd(src, i);
+      if (end > i + 1) return { start: i, end, expr: src.slice(i + 1, end) };
+    }
+    i++;
+  }
+  return null;
+}
+
 function scanExprEnd(src: string, open: number): number {
   let depth = 0;
   let i = open;
@@ -288,6 +586,36 @@ function scanExprEnd(src: string, open: number): number {
     }
     if (ch === '{') depth++;
     else if (ch === '}' && --depth === 0) return i;
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * The index just past the `}` that closes the block opener starting at
+ * `openAt` ("{#if", "{#each", ...), or -1 when it never closes. A block
+ * opener's head is an arbitrary expression, so its braces are counted with
+ * the same quote/template awareness the expression scanner uses:
+ * {#each [{id: 1}] as row} holds THREE closing braces before the opener's
+ * own, and a [^}]* regex stops at the first - silently truncating the head
+ * (the directive then reads as malformed) or, worse, matching the wrong
+ * token entirely.
+ */
+function blockOpenerEnd(src: string, openAt: number): number {
+  let i = openAt + 2; // past '{#'
+  let depth = 1;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "'" || ch === '"') {
+      i = skipQuoted(src, i);
+      continue;
+    }
+    if (ch === '`') {
+      i = skipTemplate(src, i);
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i + 1;
     i++;
   }
   return -1;
@@ -326,6 +654,23 @@ function skipTemplate(src: string, i: number): number {
   return j;
 }
 
+/**
+ * The identifier that ENDS at index `end` (inclusive), or '' if the character
+ * there is not one. Walking back is O(word); the form this replaces -
+ * `/(\w+)$/.exec(src.slice(0, end + 1))` - copied the whole prefix and let
+ * the end-anchored run try every start position, which is quadratic in the
+ * source length. It fired on every `</tag>` (a slash after a word character)
+ * and on every `/` inside a `<script>`, so a 200KB static chunk spent 11.7s
+ * in that one regex before R46 fixed it. The callers only ever compare the
+ * result against a keyword list, so accepting a leading digit (which the old
+ * pattern rejected) cannot change a decision - no keyword starts with one.
+ */
+function wordBefore(src: string, end: number): string {
+  let e = end;
+  while (e >= 0 && /[\w$]/.test(src[e])) e--;
+  return e === end ? '' : src.slice(e + 1, end + 1);
+}
+
 function skipLiteral(src: string, i: number): number | null {
   const q = src[i];
   if (q === '"' || q === "'") return skipQuoted(src, i);
@@ -336,7 +681,7 @@ function skipLiteral(src: string, i: number): number | null {
   while (b >= 0 && /\s/.test(src[b])) b--;
   if (b >= 0) {
     if (!'(,=:[!&|?{};+-*%~^'.includes(src[b])) {
-      const word = /(\w+)$/.exec(src.slice(0, b + 1))?.[1] ?? '';
+      const word = wordBefore(src, b);
       if (!['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'do', 'else', 'instanceof', 'yield', 'await'].includes(word)) return null;
     }
   }
@@ -556,13 +901,13 @@ export interface I18nConfig {
   preload?: string[];
 }
 
-export interface Rose Frame DriverConfig {
+export interface RoseFdConfig {
   plugins: Plugin[];
   i18n: I18nConfig;
   pwa?: PwaOptions;
 }
 
-export async function loadConfig(root: string): Promise<Rose Frame DriverConfig> {
+export async function loadConfig(root: string): Promise<RoseFdConfig> {
   const file = path.join(root, 'rosefd.config.js');
   if (!fs.existsSync(file)) return { plugins: [], i18n: {} };
   const mod = await import(pathToFileURL(file).href + `?t=${Date.now()}`);
@@ -836,17 +1181,48 @@ function hoistImports(script: string): { imports: string; rest: string } {
 }
 
 const __compileMemo = new Map<string, CompileResult>();
+const __memoCap = 2000;
+const __regKeyCache = new WeakMap<RoseRegistry, string>();
+const __pluginFpCache = new WeakMap<Plugin[], string>();
+function registryKey(registry: RoseRegistry): string {
+  let k = __regKeyCache.get(registry);
+  if (k === undefined) {
+    const reg: string[] = [];
+    for (const [p, e] of registry) reg.push(`${p}#${e.index}:${e.scopeKey}:${e.slots.join('|')}`);
+    k = reg.join(';');
+    __regKeyCache.set(registry, k);
+  }
+  return k;
+}
+// Only transform() can change what compileComponent() emits; onRequest/
+// onResponse/onServe/onShutdown run at serve time and never touch the compile.
+// fn.toString() is the transform's source identity: editing the plugin changes
+// the hash, so the cache self-invalidates without any file watching.
+function pluginFingerprint(plugins: Plugin[]): string {
+  let fp = __pluginFpCache.get(plugins);
+  if (fp === undefined) {
+    const parts: string[] = [];
+    for (const p of plugins) {
+      if (!p.transform) continue;
+      let src: string;
+      try { src = String(p.transform); } catch { src = 'opaque'; }
+      parts.push(`${p.name}\u0001${__fnv1a(src)}`);
+    }
+    fp = parts.join('\u0002');
+    __pluginFpCache.set(plugins, fp);
+  }
+  return fp;
+}
 function compileMemoKey(
   filePath: string,
   scopeKey: string,
   isApi: boolean,
   registry: RoseRegistry,
+  plugins: Plugin[],
 ): string | null {
   let st: fs.Stats;
   try { st = fs.statSync(filePath); } catch { return null; }
-  const reg: string[] = [];
-  for (const [p, e] of registry) reg.push(`${p}#${e.index}:${e.scopeKey}:${e.slots.join('|')}`);
-  return [filePath, String(st.mtimeMs), String(st.size), scopeKey, isApi ? '1' : '0', reg.join(';')].join('\u0000');
+  return [filePath, String(st.mtimeMs), String(st.size), scopeKey, isApi ? '1' : '0', registryKey(registry), pluginFingerprint(plugins)].join('\u0000');
 }
 const __compilerStamp = (() => {
   try { return String(fs.statSync(fileURLToPath(import.meta.url)).mtimeMs); } catch { return 'noid'; }
@@ -880,17 +1256,27 @@ function __diskGet(key: string): CompileResult | null {
 }
 function __diskSet(key: string, result: CompileResult): void {
   if (!__diskCacheDir || process.env.ROSEFD_NO_DISK_CACHE === '1') return;
+  const file = __diskFile(key);
+  const payload = JSON.stringify(result);
+  // Fire-and-forget: the compile phase already runs every file in parallel, so
+  // serial sync writes were pure cold-build tax (~1 ms each on Windows/AV).
+  // A lost write only costs a cache miss next build - never correctness. The
+  // catch is mandatory: an unhandled rejection is fatal on modern Node.
+  void fs.promises.writeFile(file, payload).catch(() => {
+    // The OS tmp reaper (or a user clean-up) can delete the cache dir under us:
+    // recreate it once and retry, or the cache stays dark until restart.
+    fs.promises.mkdir(__diskCacheDir!, { recursive: true })
+      .then(() => fs.promises.writeFile(file, payload))
+      .catch(() => { /* disk full / permission: ignore, in-process memo still holds */ });
+  });
   try {
-    fs.writeFileSync(__diskFile(key), JSON.stringify(result));
     if ((__diskWrites++ & 511) === 0) {
-      try {
-        const entries = fs.readdirSync(__diskCacheDir!);
-        if (entries.length > 5000) {
-          for (const e of entries) { try { fs.unlinkSync(path.join(__diskCacheDir!, e)); } catch { /* ignore */ } }
-        }
-      } catch { /* ignore */ }
+      const entries = fs.readdirSync(__diskCacheDir!);
+      if (entries.length > 5000) {
+        for (const e of entries) { try { fs.unlinkSync(path.join(__diskCacheDir!, e)); } catch { /* ignore */ } }
+      }
     }
-  } catch { /* disk full / permission: ignore, in-process memo still holds */ }
+  } catch { /* ignore */ }
 }
 
 async function compileComponentMemo(
@@ -901,8 +1287,7 @@ async function compileComponentMemo(
   plugins: Plugin[],
   registry: RoseRegistry,
 ): Promise<CompileResult> {
-  if (plugins.length > 0) return compileComponent(filePath, publicDir, scopeKey, isApi, plugins, registry);
-  const key = compileMemoKey(filePath, scopeKey, isApi, registry);
+  const key = compileMemoKey(filePath, scopeKey, isApi, registry, plugins);
   if (key) {
     const hit = __compileMemo.get(key);
     if (hit) return { ...hit };
@@ -911,7 +1296,10 @@ async function compileComponentMemo(
   }
   const result = await compileComponent(filePath, publicDir, scopeKey, isApi, plugins, registry);
   if (key) {
-    if (__compileMemo.size > 500) __compileMemo.clear();
+    if (__compileMemo.size >= __memoCap) {
+      const oldest = __compileMemo.keys().next().value;
+      if (oldest !== undefined) __compileMemo.delete(oldest);
+    }
     __compileMemo.set(key, result);
     __diskSet(key, result);
   }
@@ -940,6 +1328,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
       .map((m) => m[1])
       .filter((name) => HTTP_METHODS.has(name));
     const usesContext = /getContext\s*\(/.test(rawScript);
+    const usesStore = /\$store\s*\(/.test(rawScript);
     const hasPrerender = !usesContext && /(?:^|\n)\s*export\s+(?:const|let|var)\s+prerender\s*=\s*true\b/.test(rawScript);
     const hoisted = hoistImports(resolveRoseImports(rawScript, filePath, registry).script);
     const ownRuntimeImports = new Set(
@@ -960,6 +1349,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
       apiMethods,
       hasPrerender,
       usesContext,
+      usesStore,
     };
   }
 
@@ -974,7 +1364,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   const roseResolved = resolveRoseImports(scriptMatch?.[1] ?? '', filePath, registry);
   const rawScript = roseResolved.script;
   // The server-entry's node:crypto auth helpers (globalThis.__rosefdAuth) are emitted ONLY for apps that reference them - a bundle without the flag.
-  const usesRose Frame DriverAuth = rawScript.includes('__rosefdAuth');
+  const usesRoseFdAuth = rawScript.includes('__rosefdAuth');
   const roseImports = roseResolved.imports;
  
   const { imports: importStmts, rest: scriptNoImports } = hoistImports(rawScript);
@@ -1008,6 +1398,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   }
   // GetContext() in the script makes the route dynamic: the request bag is per-request.
   const usesContext = /getContext\s*\(/.test(rawScript) || /\$store\s*\(/.test(rawScript) || /\$query\s*\(/.test(rawScript);
+  const usesStore = /\$store\s*\(/.test(rawScript);
   const hasParams = /(?:^|\n)\s*export\s+(?:(?:const|let|var)\s+|(?:async\s+)?function\s+)params\b/.test(rawScript);
   const revalidateMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+revalidate\s*=\s*(\d+)\s*;?/);
   const revalidate = revalidateMatch ? Number(revalidateMatch[1]) : undefined;
@@ -1020,6 +1411,15 @@ export async function compileComponent(filePath: string, publicDir: string, scop
       'E-EXPORT',
       `${filePath}: export const prefetch must be 'off', 'hover', 'viewport' or 'all'`,
       { file: filePath, line: lineAt(rawScript, prefetchMatch), hint: "prefetch is the app-global link strategy, declared once in the root _layout.rose: 'off' | 'hover' (default) | 'viewport' | 'all'" },
+    );
+  }
+  const lazyMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+lazyHydration\s*=\s*(true|false)\s*;?/);
+  const lazyHydration = lazyMatch ? lazyMatch[1] === 'true' : undefined;
+  if (lazyMatch && !lazyHydration) {
+    throw new RoseError(
+      'E-EXPORT',
+      `${filePath}: export const lazyHydration must be true (or be absent - hydration is eager by default)`,
+      { file: filePath, line: lineAt(rawScript, lazyMatch), hint: 'omit the export entirely, or set it to exactly true - lazy hydration is opt-in per app, declared once in the root _layout.rose' },
     );
   }
   const vitalsMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+vitals\s*=\s*([^;\n]+)\s*;?/);
@@ -1381,8 +1781,57 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
         ? `{__slotDefault(${JSON.stringify(fallback)})}`
         : '{__slot__}'), comps);
   assertKnownDirectives(ssrTemplate, filePath);
+  // One file, one naming sequence: the internal {@const} thunk names restart
+  // here so they are stable and reviewable in the emitted output.
+  constUid = 0;
+  hoistedConstNames = new Set();
+  hoistTopLevelConsts = true;
   const compiledTemplate = compileTemplate(ssrTemplate, 'h', '__c', null, 0, true, comps);
-  const compiledHead = headContent.trim() ? compileHead(headContent) : '';
+  hoistTopLevelConsts = false;
+  // Capture and clear the module-level hoist state BEFORE any throw below:
+  // state left behind by a failed compile leaks into the NEXT one (a dev
+  // rebuild after an error, or a `check` run over many files) and shows up as
+  // duplicate thunk declarations in an unrelated page.
+  const hoistedConsts = hoistedConstCode;
+  const hoistedRenames = hoistedConstRenames;
+  hoistedConstCode = '';
+  hoistedConstRenames = {};
+  hoistedConstNames = new Set();
+  const hoistedDup = hoistedConstDup;
+  hoistedConstDup = null;
+  if (hoistedDup) {
+    throw new RoseError(
+      'E-TEMPLATE',
+      `${filePath}: {@const ${hoistedDup}} is declared twice at the top level`,
+      {
+        file: filePath,
+        hint: 'a const cannot be redeclared in the same scope - rename one of them, or wrap the second in a block ({#if}/{#each}) where it shadows the first instead of colliding with it',
+      },
+    );
+  }
+  // Top-level {@const} thunks now sit in the render() scope, the same scope
+  // the handlers registry is emitted in - so a handler expression that reads
+  // a const can be rewritten to the internal name and still resolve (before
+  // the hoist it was a ReferenceError, or the same-named signal's getter
+  // under a shadow). A bare-word handler is left alone: it names a script
+  // function to CALL, and a const is a value, not a handler.
+  for (const b of eventBindings) {
+    if (!/^\w+$/.test(b.fn)) b.fn = callifyStateReads(b.fn, [], hoistedRenames);
+  }
+  let compiledHead = headContent.trim() ? compileHead(headContent) : '';
+  // Route-scoped CSS (BUG.md #1): a page or layout's own top-level <style> is
+  // scoped to its own subtree and only its own route renders that subtree, so
+  // inlining it into every document is pure waste that grows with route count.
+  // Emit it as a managed head <style> block (keyed by a stable id derived from
+  // the file's scopeKey) so the document carries only its own route chain's
+  // page/layout CSS, and applyHead() swaps it out when navigating elsewhere.
+  // True components are excluded: their CSS is genuinely global and stays in
+  // styles.css (handled above), not duplicated here.
+  if (!isComponent && scopedStyle) {
+    const styleId = 'rosefd-style-' + scopeKey.replace(/[^a-zA-Z0-9_-]/g, '-');
+    const pageStyleBlock = `<style id="${styleId}">${scopedStyle}</style>`;
+    compiledHead = (compiledHead ? compiledHead + '\n' : '') + `__hd += ${JSON.stringify(pageStyleBlock)};`;
+  }
   const hasNamedSlots = /<slot\s+[^>]*\bname\s*=/.test(template);
 
   const ssrExports = actions.length > 0 ? `${exportStmts}\n${actions.map((a) => a.stmt).join('\n')}` : exportStmts;
@@ -1392,8 +1841,8 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     + (awaitExpanded.blocks.length ? '\n' + awaitBootCode(awaitExpanded.blocks) : '');
   const ssr = isMiddleware
     ? `${RUNTIME_IMPORTS}\n\n${importStmts}\n\n${ssrExports}\n${ssrGuard}\n\n${cleanScript}\n`
-    : generateSSR(cleanScript + bootCode, compiledTemplate, stateDeclsCode, ssrExports, compiledHead, props, hasNamedSlots, importStmts, isComponent, ssrGuard, actions.length > 0, dataDeclsCode);
-  const client = generateClient(cleanScript + bootCode, compiledTemplate, stateDeclsCode, eventBindings, exportStmts, compiledHead, props, hasNamedSlots, importStmts, isComponent, dataDeclsCode);
+    : generateSSR(cleanScript + bootCode, compiledTemplate, stateDeclsCode, ssrExports, compiledHead, props, hasNamedSlots, importStmts, isComponent, ssrGuard, actions.length > 0, dataDeclsCode, hoistedConsts);
+  const client = generateClient(cleanScript + bootCode, compiledTemplate, stateDeclsCode, eventBindings, exportStmts, compiledHead, props, hasNamedSlots, importStmts, isComponent, dataDeclsCode, hoistedConsts);
 
   return {
     ssr: rewriteRoseImports(ssr, 'ssr'),
@@ -1404,6 +1853,7 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     style: scopedStyle,
     hasParams,
     usesContext,
+    usesStore,
     revalidate,
     cache: cacheSeconds,
     csr,
@@ -1411,6 +1861,7 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     buffer,
     controlSignal,
     prefetch,
+    lazyHydration,
     vitals,
     bundle,
     needsClient,
@@ -1418,7 +1869,7 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     jsWarnings,
     headers,
     cspNonce,
-    usesRose Frame DriverAuth,
+    usesRoseFdAuth,
     props,
     roseImports,
     isComponent,
@@ -1651,18 +2102,22 @@ function isRegexStart(src: string, i: number): boolean {
   const p = src[j];
   if (REGEX_PRECEDERS.has(p)) return true;
   if (/[A-Za-z0-9_$]/.test(p)) {
-    const w = /([A-Za-z_$][A-Za-z0-9_$]*)$/.exec(src.slice(0, j + 1));
+    const w = wordBefore(src, j);
     if (!w) return false;
-    return ['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else'].includes(w[1]);
+    return ['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else'].includes(w);
   }
   return false;
 }
 
 function extractDecls(script: string): Decl[] {
   const decls: Decl[] = [];
+  // Match on the masked copy (comments and literals blanked) but slice every
+  // position out of the original: a comment that reads like a declaration
+  // must not match, and a real decl's expression keeps its literal text.
+  const masked = maskCommentsAndStrings(script);
   DECL_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
-  while ((m = DECL_RE.exec(script))) {
+  while ((m = DECL_RE.exec(masked))) {
     let j = m.index + m[0].length;
     const skipSpace = () => { while (j < script.length && /\s/.test(script[j])) j++; };
     skipSpace();
@@ -1769,9 +2224,96 @@ function braceDepthAt(src: string, index: number): number {
 }
 
 
+/**
+ * A copy of `src` with every comment and string/template/regex literal
+ * replaced by same-length whitespace (newlines preserved). DECL_RE runs on
+ * this: a comment that READS like a declaration ("// a const whose
+ * expression reads a signal") matches `const ... = $state` across lines,
+ * and its [^=]* span swallows the real declaration that follows - the page
+ * then compiles with a phantom binding and a missing one. Positions map 1:1
+ * to the original, so match indexes stay exact and the decl's expression is
+ * still sliced from the real source (a literal inside the expression keeps
+ * its text).
+ */
+function maskCommentsAndStrings(src: string): string {
+  let out = '';
+  let i = 0;
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to && k < src.length; k++) out += src[k] === '\n' ? '\n' : ' ';
+  };
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch;
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === quote) { j++; break; }
+        if (quote === '`' && src[j] === '$' && src[j + 1] === '{') {
+          const end = scanExprEnd(src, j + 1);
+          j = end < 0 ? src.length : end + 1;
+          continue;
+        }
+        j++;
+      }
+      blank(i, Math.min(j, src.length));
+      i = j;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i);
+      const end = nl === -1 ? src.length : nl;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2);
+      const end = close === -1 ? src.length : close + 2;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    // Regex literal: /[&<>"']/g contains quote chars - a naive scan opens a "string" mid-regex.
+    if (ch === '/' && isRegexStart(src, i)) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < src.length) {
+        const c2 = src[j];
+        if (c2 === '\\') { j += 2; continue; }
+        if (inClass) { if (c2 === ']') inClass = false; j++; continue; }
+        if (c2 === '[') inClass = true;
+        else if (c2 === '/') { j++; break; }
+        else if (c2 === '\n') break;
+        j++;
+      }
+      while (j < src.length && /[a-z]/.test(src[j])) j++;
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * JS literals that are valid standalone expressions in a condition. A bare
+ * name in a block condition is read as a SIGNAL and called - but these are
+ * not signals, and calling one is a runtime TypeError ({#if true} used to
+ * compile to ifMark(…, () => (true())…)). Kept beside autoCall because the
+ * exclusion belongs to the one place that decides.
+ */
+const JS_LITERAL_NAMES = new Set(['true', 'false', 'null', 'undefined', 'NaN', 'Infinity']);
+
 function autoCall(expr: string): string {
   const e = expr.trim();
-  return /^[A-Za-z_$][\w$]*$/.test(e) ? `${e}()` : e;
+  // __s is the each item parameter - a value, never a getter. A nested block
+  // whose source is the enclosing item ({#each docs as doc} inside an each
+  // that bound docs) has that name rewritten to __s before this runs, and
+  // calling it would throw on the value itself.
+  return /^[A-Za-z_$][\w$]*$/.test(e) && e !== '__s' && !JS_LITERAL_NAMES.has(e) ? `${e}()` : e;
 }
 
 /**
@@ -1798,19 +2340,29 @@ const DEFER_ENABLED = true;
 function expandKeyBlocks(template: string, filePath: string): string {
   if (!template.includes('{#key')) return template;
   for (let pass = 0; pass < 10; pass++) {
-    const OPEN_RE = /\{#key\s+([^}]+)\}/g;
-    OPEN_RE.lastIndex = 0;
-    const openM = OPEN_RE.exec(template);
+    const OPEN_CAND = /\{#key\b/g;
+    OPEN_CAND.lastIndex = 0;
+    const openM = OPEN_CAND.exec(template);
     if (!openM) return template;
-    const expr = openM[1].trim();
-    const bodyStart = openM.index + openM[0].length;
-    const TOK_RE = /\{[#\/](?:key|if|each|boundary|island)\b[^}]*\}/g;
+    const openEnd = blockOpenerEnd(template, openM.index);
+    if (openEnd < 0) return template;
+    const expr = template.slice(openM.index + '{#key'.length, openEnd - 1).trim();
+    if (!expr) return template;
+    const bodyStart = openEnd;
+    // Bare candidates again: every nested opener is skipped by its true end,
+    // so a head holding braces cannot mis-depth the walk.
+    const TOK_RE = /\{[#\/](?:key|if|each|boundary|island)\b/g;
     TOK_RE.lastIndex = bodyStart;
     let depth = 1;
     let closeAt = -1;
     let tm: RegExpExecArray | null;
     while ((tm = TOK_RE.exec(template))) {
-      if (tm[0].startsWith('{#')) { depth++; continue; }
+      if (tm[0].startsWith('{#')) {
+        const innerEnd = blockOpenerEnd(template, tm.index);
+        if (innerEnd >= 0) TOK_RE.lastIndex = innerEnd;
+        depth++;
+        continue;
+      }
       depth--;
       if (depth === 0) { closeAt = tm.index; break; }
     }
@@ -1848,18 +2400,35 @@ function expandKeyBlocks(template: string, filePath: string): string {
  * inside it is balanced on its own.
  */
 function expandIfElseOnce(template: string): { template: string; changed: boolean } {
-  const TOK_RE = /\{#(?:if|each|boundary|island)\b[^}]*\}|\{\/(?:if|each|boundary|island)\s*\}|\{:else(?:\s+if\s+[^}]*)?\}/g;
+  // Open tokens are bare candidates: the walk advances each past its TRUE
+  // end (blockOpenerEnd) because a head may hold braces - {#each [{id: 1}]
+  // as row} - and stopping at the first } would count the head's interior
+  // as block body and mis-depth every nested block.
+  const TOK_RE = /\{#(?:if|each|boundary|island)\b|\{\/(?:if|each|boundary|island)\s*\}|\{:else(?:\s+if\s+[^}]*)?\}/g;
   let out = '';
   let pos = 0;
   let changed = false;
   for (;;) {
-    const openM = /\{#(if|each)\s+([^}]+)\}/g.exec(template.slice(pos));
+    const slice = template.slice(pos);
+    const openCand = /\{#(if|each)\b/g;
+    const openM = openCand.exec(slice);
     if (!openM) { out += template.slice(pos); break; }
     const kind = openM[1];
-    const head = openM[2];
+    const openEndRel = blockOpenerEnd(slice, openM.index);
+    if (openEndRel < 0) { out += template.slice(pos); break; }
+    const head = slice.slice(openM.index + 2 + kind.length, openEndRel - 1);
     const start = pos + openM.index;
-    const cond = kind === 'if' ? head.trim() : '';
-    const bodyStart = start + openM[0].length;
+    const bodyStart = pos + openEndRel;
+    const parsed = parseBlockHead(kind, head);
+    if (!parsed) {
+      // Not a valid opener of this kind (an {#if} with no condition, an
+      // {#each} with no `as`): leave the token as prose and resume after
+      // it - the directive gate reports the real error later.
+      out += template.slice(pos, bodyStart);
+      pos = bodyStart;
+      continue;
+    }
+    const cond = kind === 'if' ? parsed[0].trim() : '';
     out += template.slice(pos, start);
 
     TOK_RE.lastIndex = bodyStart;
@@ -1877,14 +2446,28 @@ function expandIfElseOnce(template: string): { template: string; changed: boolea
         }
         continue;
       }
-      if (tok.startsWith('{#')) { depth++; continue; }
+      if (tok.startsWith('{#')) {
+        const innerEnd = blockOpenerEnd(template, tm.index);
+        if (innerEnd >= 0) TOK_RE.lastIndex = innerEnd;
+        depth++;
+        continue;
+      }
       depth--;
       if (depth === 0) { closeAt = tm.index; closeLen = tok.length; break; }
     }
-    if (closeAt < 0 || elses.length === 0) {
-      out += template.slice(start, closeAt < 0 ? template.length : closeAt + closeLen);
-      if (closeAt < 0) break;
-      pos = closeAt + closeLen;
+    if (closeAt < 0) {
+      out += template.slice(start);
+      break;
+    }
+    if (elses.length === 0) {
+      // No else at THIS level. Emit only the opening tag and resume the scan
+      // inside the body: emitting the whole block would leapfrog every nested
+      // block, and a nested if-with-else would keep its {:else} as literal
+      // text - which compiles to invalid JS. changed stays true because the
+      // body still needs its own passes.
+      out += template.slice(start, bodyStart);
+      pos = bodyStart;
+      changed = true;
       continue;
     }
     const body = template.slice(bodyStart, closeAt);
@@ -1898,7 +2481,10 @@ function expandIfElseOnce(template: string): { template: string; changed: boolea
       const relLast = lastBare.at - bodyStart;
       const eachBody = body.slice(0, relLast);
       const elseBody = body.slice(relLast + lastBare.len);
-      const itemsExpr = head.replace(/\s+as\s+[\w,\s]*$/, '').trim();
+      // parsed[0] is the each source with the `as item` part already split
+      // off - the old head.replace could not survive a source holding
+      // braces ({#each [{id: 1}] as row}).
+      const itemsExpr = parsed[0];
       out += template.slice(start, bodyStart) + eachBody + '{/each}'
         + `{#if !(${itemsExpr}.length)}${elseBody}{/if}`;
       pos = closeAt + closeLen;
@@ -2309,7 +2895,7 @@ function expandBoundaryFallbacks(template: string, filePath: string): string {
   return template;
 }
 
-function expandIfElse(template: string): string {  for (let pass = 0; pass < 10; pass++) {
+function expandIfElse(template: string): string {  for (let pass = 0; pass < 40; pass++) {
     if (!/\{:else\b/.test(template)) return template;
     const r = expandIfElseOnce(template);
     template = r.template;
@@ -2413,6 +2999,19 @@ function expandAwaitBlocks(template: string, filePath: string): { template: stri
       throw new RoseError('E-TEMPLATE', `${filePath}: {#await} needs a promise expression`, {
         file: filePath, hint: 'write {#await fetchUsers()}...{:then users}...{/await}' });
     }
+    // `{#await p then users}` (the branch inline in the opener) is not the
+    // syntax - rosefd spells it with a {:then users} line inside the block.
+    // Left alone the opener leaks into the output as literal text, so refuse
+    // it here. A trailing word after then/catch is the tell: a promise method
+    // call (`p.then(r => …)`, `p.catch(e => …)`) is followed by `(`, never a
+    // bare name at the end.
+    const inlineBranch = /\b(then|catch)\s+[A-Za-z_$][\w$]*\s*$/.exec(expr);
+    if (inlineBranch) {
+      throw new RoseError('E-TEMPLATE', `${filePath}: {#await ${expr}} puts the ${inlineBranch[1]} branch in the opener`, {
+        file: filePath,
+        hint: `write the branch on its own line inside the block:\n{#await ${expr.replace(/\s+(then|catch)\s+[A-Za-z_$][\w$]*\s*$/, '')}}\n  …pending…\n{:${inlineBranch[1]} ${inlineBranch[0].trim().split(/\s+/)[1]}}\n  …${inlineBranch[1] === 'then' ? 'fulfilled' : 'rejected'}…\n{/await}`,
+      });
+    }
     const blockOpenRe = /\{\#(if|each|boundary|island|await)\b/g;
     const blockCloseRe = /\{\/(if|each|boundary|island|await)\}/g;
     const thenRe = /\{:then\b([^}]*)\}/g;
@@ -2449,8 +3048,10 @@ function expandAwaitBlocks(template: string, filePath: string): { template: stri
       j = m.index + m[0].length;
     }
     if (closeAt < 0 || thenAt < 0) break;
+    // '{:then' is 6 chars, '{:catch' is 7 - each token end is its opener,
+    // the raw name, and the closing brace, so the offsets differ by one.
     const thenTokenEnd = thenAt + 7 + thenRaw.length;
-    const catchTokenEnd = catchAt >= 0 ? catchAt + 7 + catchRaw.length : -1;
+    const catchTokenEnd = catchAt >= 0 ? catchAt + 8 + catchRaw.length : -1;
     const pending = template.slice(i, thenAt);
     const thenBody = template.slice(thenTokenEnd, catchAt >= 0 ? catchAt : closeAt);
     const catchBody = catchAt >= 0 ? template.slice(catchTokenEnd, closeAt) : '';
@@ -2491,47 +3092,68 @@ function awaitBootCode(blocks: AwaitBlock[]): string {
   return code;
 }
 
+/**
+ * The capture groups of one block opener's head (everything between the
+ * braces), in the order findBlock's callers destructure them, or null when
+ * the head is not a valid opener of this kind (findBlock then moves on to
+ * the next candidate). The head arrives already isolated by
+ * blockOpenerEnd, so its patterns may span braces: {#each [{id: 1}] as row}
+ * has a head of " [{id: 1}] as row ".
+ */
+function parseBlockHead(kind: 'if' | 'each' | 'boundary' | 'island' | 'snippet', head: string): string[] | null {
+  if (kind === 'if') {
+    const m = /^\s*([\s\S]+?)\s*$/.exec(head);
+    return m ? [m[1]] : null;
+  }
+  if (kind === 'each') {
+    const m = /^\s*([\s\S]+?)\s+as\s+(\{[^{}]*\}|\[[^[\]]*\]|\w+)(?:\s*,\s*(\w+))?(?:\s*\(([\s\S]+)\))?\s*$/.exec(head);
+    return m ? [m[1], m[2], m[3] ?? '', m[4] ?? ''] : null;
+  }
+  if (kind === 'boundary') return [head];
+  if (kind === 'island') {
+    const m = /^\s*(?:name="([^"]*)")?(?:\s*hydrate="([^"]*)")?\s*$/.exec(head);
+    return m ? [m[1] ?? '', m[2] ?? ''] : null;
+  }
+  const m = /^\s*(\w+)(?:\s*\(([\s\S]+)\))?\s*$/.exec(head);
+  return m ? [m[1], m[2] ?? ''] : null;
+}
+
 function findBlock(src: string, kind: 'if' | 'each' | 'boundary' | 'island' | 'snippet'): RegExpExecArray | null {
-  const head = kind === 'boundary'
-    ? /\{#boundary(?:\s+([^}]*))?\}/g
-    : kind === 'if'
-      ? /\{#if\s+([^}]+)\}/g
-      : kind === 'island'
-        ? /\{#island(?:\s+name="([^"]*)")?(?:\s+hydrate="([^"]*)")?\s*\}/g
-        : kind === 'snippet'
-          ? /\{#snippet\s+(\w+)(?:\s*\(([^)]+)\))?\s*\}/g
-          : /\{#each\s+([^}]+?)\s+as\s+(\{[^{}]*\}|\[[^[\]]*\]|\w+)(?:\s*,\s*(\w+))?(?:\s*\(([^)]+)\))?\}/g;
+  const openCand = new RegExp(`\\{#${kind}\\b`, 'g');
   const closeRe = new RegExp(`\\{/${kind}\\}`, 'g');
   let open: RegExpExecArray | null;
-  while ((open = head.exec(src))) {
+  while ((open = openCand.exec(src))) {
     const start = open.index;
-    const afterOpen = start + open[0].length;
+    const openEnd = blockOpenerEnd(src, start);
+    if (openEnd < 0) continue;
+    const parsed = parseBlockHead(kind, src.slice(start + 2 + kind.length, openEnd - 1));
+    if (!parsed) continue;
     let depth = 1;
-    let i = afterOpen;
+    let i = openEnd;
     for (;;) {
-      head.lastIndex = i;
+      openCand.lastIndex = i;
       closeRe.lastIndex = i;
-      const nextOpen = head.exec(src);
+      const nextOpen = openCand.exec(src);
       const nextClose = closeRe.exec(src);
       if (!nextClose) break;
       if (nextOpen && nextOpen.index < nextClose.index) {
+        // Advance past the nested opener's TRUE end: its head may hold
+        // braces (an object literal in the each source), and stopping at
+        // the first one would count its interior as block body.
+        const innerEnd = blockOpenerEnd(src, nextOpen.index);
         depth++;
-        i = nextOpen.index + nextOpen[0].length;
+        i = innerEnd < 0 ? nextOpen.index + nextOpen[0].length : innerEnd;
         continue;
       }
       i = nextClose.index + nextClose[0].length;
       if (--depth === 0) {
-        const content = src.slice(afterOpen, nextClose.index);
-        const groups = kind === 'boundary' ? [open[1] ?? '', content]
-          : kind === 'island' ? [open[1] ?? '', open[2] ?? '', content]
-          : kind === 'snippet' ? [open[1], open[2] ?? '', content]
-          : kind === 'if' ? [open[1], content] : [open[1], open[2], open[3] ?? '', open[4] ?? '', content];
-        const arr = [src.slice(start, i), ...groups] as unknown as RegExpExecArray;
+        const content = src.slice(openEnd, nextClose.index);
+        const arr = [src.slice(start, i), ...parsed, content] as unknown as RegExpExecArray;
         (arr as any).index = start;
         return arr;
       }
     }
-    head.lastIndex = afterOpen;
+    openCand.lastIndex = openEnd;
   }
   return null;
 }
@@ -2599,7 +3221,9 @@ function blockCloseRes(kind: string): { open: RegExp; close: RegExp } {
   let hit = __blockResCache.get(kind);
   if (!hit) {
     hit = {
-      open: new RegExp(`\\{#${kind}\\b[^}]*\\}`, 'g'),
+      // A bare candidate: the opener's true end comes from blockOpenerEnd,
+      // because the head is an expression and may hold braces.
+      open: new RegExp(`\\{#${kind}\\b`, 'g'),
       close: new RegExp(`\\{/${kind}\\}`, 'g'),
     };
     __blockResCache.set(kind, hit);
@@ -2688,11 +3312,14 @@ function assertKnownDirectives(template: string, filePath: string): void {
       { file: filePath, line: lineAt(template, m), hint: 'rosefd templates support {#if}/{:else}, {#each} and {#boundary}' },
     );
   }
-  const OPENER_RE = /\{#(if|each|boundary|island|await)\b([^}]*)\}/g;
-  while ((m = OPENER_RE.exec(template))) {
+  const OPENER_CAND = /\{#(if|each|boundary|island|await)\b/g;
+  while ((m = OPENER_CAND.exec(template))) {
     if (inRaw(m.index)) continue;
-    const [, kind, head] = m;
-    if (kind === 'each' && !/\bas\s+(\{[^{}]*\}?|\[[^[\]]*\]?|\w+)(?:\s*,\s*\w+)?(?:\s*\([^)]*\))?\s*$/.test(head)) {
+    const kind = m[1];
+    const openEnd = blockOpenerEnd(template, m.index);
+    if (openEnd < 0) continue;
+    const head = template.slice(m.index + 2 + kind.length, openEnd - 1);
+    if (kind === 'each' && !parseBlockHead('each', head)) {
       throw new RoseError(
         'E-TEMPLATE',
         `${filePath}: {#each ${head.trim()}} is missing its item name`,
@@ -2701,7 +3328,7 @@ function assertKnownDirectives(template: string, filePath: string): void {
     }
     const { open: OPEN_RE, close: CLOSE_RE } = blockCloseRes(kind);
     let depth = 1;
-    let i = m.index + m[0].length;
+    let i = openEnd;
     for (;;) {
       OPEN_RE.lastIndex = i;
       CLOSE_RE.lastIndex = i;
@@ -2709,7 +3336,11 @@ function assertKnownDirectives(template: string, filePath: string): void {
       const nextClose = CLOSE_RE.exec(template);
       if (!nextClose) break;
       if (nextOpen && nextOpen.index < nextClose.index) {
-        i = nextOpen.index + nextOpen[0].length;
+        // Past the nested opener's true end: a head holding braces (an
+        // object literal in an each source) must not have its interior
+        // counted as this block's body.
+        const innerEnd = blockOpenerEnd(template, nextOpen.index);
+        i = innerEnd < 0 ? nextOpen.index + nextOpen[0].length : innerEnd;
         continue;
       }
       i = nextClose.index + nextClose[0].length;
@@ -2758,6 +3389,37 @@ function rewriteQuotedExprAttrs(template: string, comps: Map<string, unknown>): 
   });
 }
 
+/**
+ * Per-file counter behind the internal {@const} thunk names. compileComponent
+ * resets it so one file's names are stable and reviewable; compileTemplate is
+ * recursive (blocks, slots, islands) but single-threaded, so a module-level
+ * counter stays unique without threading a mutable through every recursion.
+ */
+let constUid = 0;
+/**
+ * A TOP-LEVEL {@const} thunk is hoisted out of __root into the render()
+ * scope. Handlers are lifted into the handlers registry in that same scope,
+ * so a handler expression can only see a const whose thunk sits there - and
+ * the hoist is what makes {@const} usable inside on:click={…}. Block-level
+ * consts stay where they are compiled (they may read block bindings, which
+ * the render scope does not have). compileComponent flips the flag around
+ * the one depth-0 compileTemplate call, so compileHead's segments keep
+ * emitting inline.
+ */
+let hoistTopLevelConsts = false;
+let hoistedConstCode = '';
+let hoistedConstRenames: Record<string, string> = {};
+// Top-level {@const} names seen during the hoist pass. A name may shadow a
+// $state/$derived/function, and a block may re-declare it - but the SAME
+// scope cannot declare it twice: the flat hoistedConstRenames map is keyed
+// by source name, so a second top-level declaration would silently capture
+// every handler expression that sits between the two (it would read the
+// second thunk where the nearest preceding binding is the first). Rather
+// than approximate positions, redeclaration is a build error - the same
+// answer plain JS gives for `const x` twice in one scope.
+let hoistedConstNames = new Set<string>();
+let hoistedConstDup: string | null = null;
+
 function compileTemplate(
   template: string,
   acc: string,
@@ -2779,11 +3441,38 @@ function compileTemplate(
 
   if (depth === 0) result += 'const __snip = {};\n';
 
+  // One pass renames every {@const} use of this scope to its internal thunk.
+  // The loop below then only emits the declaration - no per-const re-walk of
+  // the remaining template (which was quadratic in the const count). Ids are
+  // handed out here in source order for THIS scope; nested scopes (blocks,
+  // component children) get theirs when their recursive call runs its own
+  // pass, so the numbering is per-scope first, then by depth.
+  const scopeConstIds = new Map<string, string>();
+  const scopeConsts = scopeConstNames(template, comps);
+  // A name declared twice in ONE scope maps to two thunks, and a flat
+  // name -> id map cannot tell them apart (the collapse would emit the same
+  // internal name twice - a duplicate declaration esbuild rejects). That is
+  // broken source either way (plain JS refuses it at the top level, and the
+  // hoist pass reports it there), so such a scope skips the upfront pass and
+  // every declaration takes the per-declaration fallback - the pre-R45 walk,
+  // which numbers each occurrence separately and keeps the shadowing reads.
+  const uniqueConsts = new Set(scopeConsts).size === scopeConsts.length;
+  if (scopeConsts.length > 0 && uniqueConsts) {
+    const renames: Record<string, string> = {};
+    for (const name of scopeConsts) {
+      const internal = `__rvct${constUid++}`;
+      scopeConstIds.set(name, internal);
+      renames[name] = internal;
+    }
+    template = callifyTemplateExprs(template, [], renames, { ownScope: true, comps });
+    remaining = template;
+  }
+
   while (remaining.length > 0) {
     const ifMatch = findBlock(remaining, 'if');
     const eachMatch = findBlock(remaining, 'each');
     const boundaryMatch = findBlock(remaining, 'boundary');
-    const firstExpr = templateExprSpans(remaining)[0];
+    const firstExpr = firstExprSpan(remaining);
     const exprMatch = firstExpr
       ? Object.assign([remaining.slice(firstExpr.start, firstExpr.end + 1), firstExpr.expr], { index: firstExpr.start }) as unknown as RegExpExecArray
       : null;
@@ -2884,8 +3573,14 @@ function compileTemplate(
       if (effMarkers) {
         result += `${acc} += eachMark(${closes}, () => (${call}), __b${id}${keyFn});\n`;
       } else {
+        // No markers: the surrounding content of an islands page compiles to
+        // plain concatenation - the each renders once per pass with no
+        // patching machinery. One ) closes .map(, one closes nothing - the
+        // arrow body `__bX(param, [])` is already complete. (An extra one
+        // here is an unbalanced-paren build failure the moment the page
+        // contains an island, because only then does this branch run.)
         const param = isDestructure ? '__s' : item;
-        result += `${acc} += (${call}).map((${param}${index ? ', __i' : ''}) => __b${id}(${param}, []${index ? ', __i' : ''}))).join('');\n`;
+        result += `${acc} += (${call}).map((${param}${index ? ', __i' : ''}) => __b${id}(${param}, []${index ? ', __i' : ''})).join('');\n`;
       }
       remaining = remaining.substring(earliest.index + earliest.match[0].length);
     } else if (earliest.type === 'boundary') {
@@ -2989,8 +3684,61 @@ function compileTemplate(
       const constMatch = /^@const\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/.exec(trimmed);
       if (constMatch) {
         if (before) result += emitChunk(before, acc, closes, scope);
-        result += `const ${constMatch[1]} = (${constMatch[2].trim()});\n`;
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        const constName = constMatch[1];
+        const rest = remaining.substring(earliest.index + earliest.match[0].length);
+        // A const compiles to a THUNK, exactly like $derived: its
+        // expression may read signals, and only a use site that re-reads
+        // them (the compiled call) subscribes the wire() effect. Emitting a
+        // plain value would freeze the first evaluation - a top-level
+        // {@const} has no enclosing block effect to re-run it, so the text
+        // would go stale on the first signal write.
+        //
+        // The thunk takes an INTERNAL name, never the source one: a const
+        // may shadow a $state, a $derived, or a script function, and reusing
+        // the name would either re-declare the binding (a SyntaxError at the
+        // top level, where both live in the same scope) or capture the outer
+        // value instead of the signals the initializer reads.
+        //
+        // Uses were rewritten to the internal name by the upfront pass at
+        // the top of this function - one walk for the whole scope, instead
+        // of a re-walk of everything after each declaration. The pass is
+        // scope-aware: a nested declaration of the same name takes over
+        // from its own point on (its own recursive call owns those uses)
+        // and the outer const is visible again after its block closes. The
+        // initializer arrives already callified AND already renamed: the
+        // state pass ran over the whole template first, and it processed
+        // this declaration's initializer BEFORE the name joined its shadow
+        // set, so a bare read of the shadowed signal there became a getter
+        // call - and the const pass likewise rewrote a read of an OUTER
+        // const there before this name joined the shadow set.
+        let internal = scopeConstIds.get(constName);
+        // The declaration is consumed either way. In the normal path the
+        // upfront pass already renamed every use, so the plain rest is what
+        // is left; forgetting this line is an infinite loop (the same span
+        // matches forever) - which is how the upfront pass first landed.
+        remaining = rest;
+        if (internal === undefined) {
+          // Guard for a construct the expanders left in place that the
+          // pre-scan counts as a block boundary: fall back to the old
+          // per-declaration pass so such a template still compiles.
+          internal = `__rvct${constUid++}`;
+          remaining = callifyTemplateExprs(rest, [], { [constName]: internal });
+        }
+        const decl = `const ${internal} = () => (${constMatch[2].trim()});\n`;
+        if (hoistTopLevelConsts && depth === 0) {
+          // Hoisted to the render() scope: the handlers registry lives there,
+          // so an on:click={…} expression can call this thunk. Uses inside
+          // __root still resolve it through the closure.
+          if (hoistedConstNames.has(constName)) {
+            hoistedConstDup = constName;
+          } else {
+            hoistedConstNames.add(constName);
+          }
+          hoistedConstCode += decl;
+          hoistedConstRenames[constName] = internal;
+        } else {
+          result += decl;
+        }
         continue;
       }
       if (trimmed === '__slot__') {
@@ -3469,7 +4217,7 @@ function compileSlot(acc: string): string {
   return `${acc} += String(children);\n`;
 }
 
-const RUNTIME_IMPORTS = `import { state, setState, persistState, $data, hasState, isSeeded, markSeeded, esc, refresh, onMount, onCleanup, $effect, getContext, $query, $t, bestLocale, localeDir, ensureLocale, loadLocale, handlers, directives, $cookies, $sessionCookie, $store, ActionError, $actionError, $actionErrorOrThrow, $actionPending, $boundaryFallback, $setBoundaryError, $boundaryError, $append, $prepend, $merge, applyStateDeltas, textMark, attrMark, boolAttrMark, ifMark, eachMark, headMark, rawMark, slotBlockMark, redirect, notFound, aggregate, loader, encodeSdui, decodeSdui } from './runtime.js';`;
+const RUNTIME_IMPORTS = `import { state, setState, persistState, $data, hasState, isSeeded, markSeeded, esc, refresh, onMount, onCleanup, $effect, getContext, $query, $t, bestLocale, localeDir, ensureLocale, loadLocale, handlers, directives, $cookies, $sessionCookie, $store, $udp, $tcp, $listen, $websocket, $mqtt, parseLoRaWAN, ActionError, $actionError, $actionErrorOrThrow, $actionPending, $boundaryFallback, $setBoundaryError, $boundaryError, $append, $prepend, $merge, applyStateDeltas, textMark, attrMark, boolAttrMark, ifMark, eachMark, headMark, rawMark, slotBlockMark, redirect, notFound, aggregate, loader, encodeSdui, decodeSdui } from './runtime.js';`;
 
 const API_RUNTIME_HELPERS = RUNTIME_IMPORTS
   .replace(/^import\s*\{/, '')
@@ -3508,7 +4256,7 @@ const __slotDefault = (children, fallback) => {
   return fallback || '';
 };`;
 
-function generateSSR(script: string, templateFn: string, stateDeclsCode: string, exports = '', headFn = '', props: Array<{ name: string; def: string | null }> = [], namedSlots = false, imports = '', isComponent = false, guard = '', hasActions = false, dataDeclsCode = ''): string {
+function generateSSR(script: string, templateFn: string, stateDeclsCode: string, exports = '', headFn = '', props: Array<{ name: string; def: string | null }> = [], namedSlots = false, imports = '', isComponent = false, guard = '', hasActions = false, dataDeclsCode = '', hoistedConsts = ''): string {
   // The head block renders to a clean html string (no markers) and is wrapped in an h marker pair: renderPage extracts it for <head> injection.
   const headCode = headFn
     ? `
@@ -3535,7 +4283,8 @@ export ${isComponent ? 'function' : 'async function'} render(closes, children, _
   ${script}
   ${stateDeclsCode}
   ${dataDeclsCode}
- 
+  ${hoistedConsts}
+
   ${isComponent ? '' : 'applyStateDeltas();'}
   const __root = (__c, children) => { let h = ''; ${templateFn} return h; };
   let __html = ${isComponent ? '' : 'await '}__root(closes, children);${headCode}
@@ -3555,7 +4304,8 @@ function generateClient(
   namedSlots = false,
   imports = '',
   isComponent = false,
-  dataDeclsCode = ''
+  dataDeclsCode = '',
+  hoistedConsts = ''
 ): string {
   const handlerRegistry = eventBindings.length > 0
     ? `Object.assign(handlers, { ${eventBindings.map((b) => b.fn).join(', ')} });`
@@ -3585,6 +4335,7 @@ export ${isComponent ? 'function' : 'async function'} render(closes, children, _
   ${script}
   ${stateDeclsCode}
   ${dataDeclsCode}
+  ${hoistedConsts}
   ${handlerRegistry}
   const __root = (__c, children) => { let h = ''; ${templateFn} return h; };
   let __html = ${isComponent ? '' : 'await '}__root(closes, children);${headCode}
@@ -3611,6 +4362,12 @@ const layoutsOf = (infos: RouteInfo[], idx: number): number[] =>
 const routeShipsNoJs = (infos: RouteInfo[], compiled: CompileResult[], i: number): boolean => {
   if (compiled[i].csr === true) return false;
   if (compiled[i].needsClient) return false;
+  // shell = false is an explicit "the client router paints this document"
+  // contract: the bootstrap wraps the shell-less SSR content into #app at boot
+  // and every later path (adoption, navigation, forms) is the ordinary one -
+  // which needs the bundle. The zero-JS decision must yield to it, or a
+  // shell-off route ships a document its own bootstrap can never run.
+  if (routeShellOff(infos, compiled, i)) return false;
   return !layoutsOf(infos, i).some((li) => compiled[li].needsClient);
 };
 
@@ -3703,15 +4460,19 @@ for (const el of document.querySelectorAll('[data-rosefd]')) {
 }
 `;
 
-export async function buildProject(root: string, outDir: string): Promise<{ routes: RouteInfo[]; bundle: string }> {
+const __writtenContent = new Map<string, string>();
+let __writtenFor: string | null = null;
+
+export async function buildProject(root: string, outDir: string, opts: { minify?: boolean; incremental?: boolean } = {}): Promise<{ routes: RouteInfo[]; bundle: string; config: RoseFdConfig }> {
+  const minify = opts.minify !== false;
+  const incremental = opts.incremental === true;
   await fs.promises.mkdir(outDir, { recursive: true });
 
   const stale = (await fs.promises.readdir(outDir)).filter((f) =>
     /^(?:comp-\d+\.(?:ssr|client)|runtime|(?:server|client)-entry)\.js$/.test(f));
   await Promise.all(stale.map((f) => fs.promises.rm(path.join(outDir, f), { force: true })));
 
-  const pageFiles = await scanRoseFiles(root);
-  const compFiles = await scanComponentFiles(root);
+  const [pageFiles, compFiles] = await Promise.all([scanRoseFiles(root), scanComponentFiles(root)]);
   const files = [...pageFiles, ...compFiles];
   if (pageFiles.length === 0) {
     throw new RoseError(
@@ -3730,10 +4491,17 @@ export async function buildProject(root: string, outDir: string): Promise<{ rout
   const registry: RoseRegistry = new Map(
     files.map((f, i) => [f, { index: i, scopeKey: scopeKeys[i], slots: scanSlotDecls(f) }])
   );
+  // The first esbuild call of a process pays a service spawn (~20ms warm,
+  // ~90ms cold on Windows/AV) and every later call is sub-millisecond. The
+  // bundling phase below is the first user of the service, so kick a throwaway
+  // transform off now: the spawn overlaps the .rose compile instead of
+  // serializing in front of it. A failure here is irrelevant - the real builds
+  // report their own errors.
+  const esbuildWarm = esbuild.transform('export default 0', { loader: 'js' }).catch(() => {});
   const compiled = await Promise.all(
     files.map((f, i) => compileComponentMemo(f, path.join(root, 'public'), scopeKeys[i], infos[i].isApi, plugins, registry))
   );
-
+  await esbuildWarm;
   const importsOf = new Map<number, number[]>();
   files.forEach((_, i) => {
     const list: number[] = [];
@@ -3777,18 +4545,27 @@ export async function buildProject(root: string, outDir: string): Promise<{ rout
     if (!infos[i].isComponent) visit(i);
   });
 
+  // styles.css carries ONLY component CSS. Component styles are global by
+  // nature - the same component renders identically on every route it appears
+  // on, so shipping all reachable component CSS once per document is correct
+  // and bounded by total component CSS, not by route count. Page and layout
+  // top-level <style> are route-scoped instead: they are emitted as managed
+  // head <style> blocks (see compileComponent) so each document carries only
+  // its own route chain's page/layout CSS and the previous route's is dropped
+  // on client navigation. This closes BUG.md #1 (a backend-only page's CSS
+  // used to be inlined into every front document).
   const styles = compiled
-    .map((c, i) => (reachable.has(i) ? c.style : ''))
+    .map((c, i) => (reachable.has(i) && infos[i].isComponent ? c.style : ''))
     .filter(Boolean).join('\n');
   if (styles) await fs.promises.writeFile(path.join(outDir, 'styles.css'), styles);
   else await fs.promises.rm(path.join(outDir, 'styles.css'), { force: true });
 
   let locales: Record<string, Record<string, string>> = {};
   try {
-    for (const f of await fs.promises.readdir(path.join(root, 'src', 'locales'))) {
-      if (!f.endsWith('.json')) continue;
-      locales[f.slice(0, -5)] = JSON.parse(await fs.promises.readFile(path.join(root, 'src', 'locales', f), 'utf-8'));
-    }
+    const localeDir = path.join(root, 'src', 'locales');
+    const localeFiles = (await fs.promises.readdir(localeDir)).filter((f) => f.endsWith('.json'));
+    const loaded = await Promise.all(localeFiles.map(async (f) => [f.slice(0, -5), JSON.parse(await fs.promises.readFile(path.join(localeDir, f), 'utf-8'))] as const));
+    locales = Object.fromEntries(loaded);
   } catch {
     locales = {};
   }
@@ -3809,9 +4586,26 @@ export async function buildProject(root: string, outDir: string): Promise<{ rout
   const clientLocales = Object.fromEntries(Object.keys(locales).filter((l) => !packed.includes(l)).map((l) => [l, locales[l]]));
   const clientLocalesJson = JSON.stringify(clientLocales).replace(/</g, '\\u003c');
 
-  const buildDir = path.join(outDir, '.build');
-  await fs.promises.rm(buildDir, { recursive: true, force: true });
+  // Build intermediates live in a per-build dir under the project, never in
+  // dist: they are pure esbuild inputs, and deleting ~570 of them out of dist
+  // at the end of every build costs seconds on Windows (per-file unlink
+  // latency, not concurrency). dist then stays clean by construction, and the
+  // project-local location keeps every generated import relative (and so
+  // resolvable by esbuild, which rejects file:// specifiers).
+  const buildRoot = path.join(root, '.rosefd-build');
+  const buildDir = path.join(buildRoot, `${process.pid}-${__fnv1a(path.resolve(root))}`);
+  // Stable across this process's builds of this project: intermediates whose
+  // content is unchanged stay on disk instead of being rewritten (a hot dev
+  // rebuild then writes nothing but the entries). mkdir + utimes run BEFORE
+  // the sweep so an idle-but-live dir is refreshed, never reaped mid-session;
+  // a dir that appeared from nothing (swept or user-deleted) drops the skip
+  // map so every intermediate is rewritten against the empty dir.
+  const dirExisted = fs.existsSync(buildDir);
   await fs.promises.mkdir(buildDir, { recursive: true });
+  const stamp = new Date();
+  await fs.promises.utimes(buildDir, stamp, stamp);
+  if (!dirExisted || __writtenFor !== buildDir) { __writtenContent.clear(); __writtenFor = buildDir; }
+  sweepStaleBuildDirs(buildRoot);
   const contentSrcCands = [path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'cli', 'content.ts'), path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli', 'content.ts')];
   const contentSrc = contentSrcCands.find((c) => fs.existsSync(c)) ?? contentSrcCands[0];
   fs.copyFileSync(contentSrc, path.join(buildDir, 'content-md.ts'));
@@ -3836,21 +4630,64 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
     .map((rel) => fileURLToPath(new URL(rel, import.meta.url)))
     .find((p) => fs.existsSync(p));
   if (!runtimeEntry) throw new RoseError('E-INTERNAL', 'Rose Frame Driver: the runtime source (src/runtime/index.ts) was not found next to the compiler', { hint: 'the published package ships src/ beside dist-cli/ - reinstall it, or run from a checkout' });
-  await esbuild.build({
+  // Both bundle framework sources only - neither reads anything this build
+  // generates (the prod server imports dist/server.js at runtime; the runtime
+  // entry is self-contained) - so they start here and overlap the whole
+  // compile + write phase instead of serializing ahead of it.
+  const runtimeBuild = runEsbuild(runtimeEntry, {
     entryPoints: [runtimeEntry],
     bundle: true,
     outfile: path.join(buildDir, 'runtime.js'),
     format: 'esm',
     platform: 'browser',
     write: true,
-  });
+  }, incremental);
+  const prodEntry = (() => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    for (const cand of [path.join(here, '..', 'cli', 'prod-server.ts'), path.join(here, '..', 'src', 'cli', 'prod-server.ts')]) {
+      if (fs.existsSync(cand)) return cand;
+    }
+    return path.join(here, '..', 'cli', 'prod-server.ts');
+  })();
+  // prod.mjs is the serverless/Vercel entry - the dev server and `rosefd serve`
+  // run server.js, so a dev hot-rebuild never needs it.
+  const prodBuild: Promise<esbuild.BuildResult> = incremental
+    ? Promise.resolve({} as esbuild.BuildResult)
+    : runEsbuild(prodEntry, {
+      entryPoints: [prodEntry],
+      bundle: true,
+      outfile: path.join(outDir, 'prod.mjs'),
+      format: 'esm',
+      platform: 'node',
+      write: true,
+      banner: {
+        js: "import { createRequire } from 'node:module'; import { fileURLToPath as __f2p } from 'node:url'; import { dirname as __dn } from 'node:path'; const require = createRequire(import.meta.url); const __filename = __f2p(import.meta.url); const __dirname = __dn(__filename);"
+      },
+      ...TS_LOADER,
+      ...(minify ? { minify: true, keepNames: true } : {}),
+    }, incremental);
+  runtimeBuild.catch(() => {});
+  prodBuild.catch(() => {});
 
+  const compWrites: Promise<void>[] = [];
+  const writeIfChanged = (name: string, content: string): void => {
+    // A memo hit hands back the very string references the previous build
+    // wrote, so === proves the bytes already on disk are these bytes. A fresh
+    // compile (or a disk-cache hit, which JSON-parses new strings) always
+    // rewrites - the skip only fires on the hot path it is meant for.
+    if (__writtenContent.get(name) === content) return;
+    __writtenContent.set(name, content);
+    compWrites.push(fs.promises.writeFile(path.join(buildDir, name), content));
+  };
   for (let i = 0; i < compiled.length; i++) {
     const src = compiled[i].api ?? compiled[i].ssr;
-    await fs.promises.writeFile(path.join(buildDir, `comp-${i}.ssr.js`), src);
+    writeIfChanged(`comp-${i}.ssr.js`, src);
     if (!infos[i].isApi) {
-      await fs.promises.writeFile(path.join(buildDir, `comp-${i}.client.js`), compiled[i].client);
+      writeIfChanged(`comp-${i}.client.js`, compiled[i].client);
     }
+  }
+  for (let c = 0; c < compWrites.length; c += 64) {
+    await Promise.all(compWrites.slice(c, c + 64));
   }
 
   const pages = infos
@@ -3902,7 +4739,22 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
     return expr;
   };
 
-  const bundleMode = compiled.find((c) => c.bundle)?.bundle ?? 'inline';
+  // The bundle mode is an APP-level switch, so only the root layout may set
+  // it: `compiled.find(...)` used to let the first file that exported it win,
+  // and a leaf page carrying `export const bundle = 'split'` silently flipped
+  // every document in the app to the external-runtime mode (two extra requests
+  // on routes that never asked for it). A misplacement is a build error that
+  // names the file, not a surprise.
+  const rootLayout = path.join(root, 'src', 'pages', '_layout.rose');
+  const misplaced = files.findIndex((f, i) => compiled[i].bundle && f !== rootLayout);
+  if (misplaced >= 0) {
+    throw new RoseError(
+      'E-BUNDLE',
+      `${path.basename(files[misplaced])}: export const bundle switches the whole app's bundle mode, so it belongs in the root layout (src/pages/_layout.rose)`,
+      { file: files[misplaced], hint: "move `export const bundle = 'split'` (or 'inline') to src/pages/_layout.rose - the mode is per-app, not per-page" },
+    );
+  }
+  const bundleMode = compiled[files.indexOf(rootLayout)]?.bundle ?? 'inline';
   const split = bundleMode === 'split';
   const chainOf = (idx: number): number[] => [idx, ...layoutsOf(infos, idx)];
   const loaderInner = (idx: number): string =>
@@ -3992,13 +4844,18 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
     })
     .join(',\n  ');
 
-  const appUsesAuth = compiled.some((c) => c.usesRose Frame DriverAuth);
+  const appUsesAuth = compiled.some((c) => c.usesRoseFdAuth);
+  const appUsesNet = compiled.some((c) => /\$(?:udp|tcp|listen|mqtt)\s*\(/.test((c.ssr || '') + (c.client || '') + (c.api || '')));
+  const appUsesWs = compiled.some((c) => /\$websocket\s*\(/.test((c.ssr || '') + (c.client || '') + (c.api || '')));
 
   const serverEntry = `
 ${serverImports}
 import { renderMarkdown } from './content-md.ts';
 ${appUsesAuth ? "import crypto from 'node:crypto';" : "// no route references __rosefdAuth: the node:crypto auth helpers are omitted, keeping the bundle edge-loadable"}
-import { setState, persistState, clearRequestState, isolateRender, serializeState, resetRequestContext, installContextStore, setRequestQuery, isLocale, setLocales, localeList, localeDir, setStoreTransport, applyStorePatch, ActionError, StateDelta, setStateDelta, esc } from './runtime.js';
+${appUsesNet ? "import * as __rosefdDgram from 'node:dgram';\nimport * as __rosefdNet from 'node:net';" : "// no route opens a network listener ($udp/$tcp/$listen): the node:dgram/node:net imports are omitted, keeping the bundle edge-loadable"}
+${appUsesWs ? "import * as __rosefdHttp from 'node:http';\nimport * as __rosefdCrypto from 'node:crypto';" : "// no route opens a WebSocket server ($websocket): the node:http/node:crypto imports are omitted, keeping the bundle edge-loadable"}
+import { setState, persistState, clearRequestState, isolateRender, serializeState, resetRequestContext, installContextStore, setRequestQuery, getRequestQuery, isLocale, setLocales, localeList, localeDir, setStoreTransport, applyStorePatch, ActionError, StateDelta, setStateDelta, esc, __startNetwork, __stopNetwork, $udp, $tcp, $listen, $websocket, $mqtt } from './runtime.js';
+export { __startNetwork, __stopNetwork };
 ${runtimePlugins.length > 0
     ? `import { hooks as __pluginHooks, hasRequestHooks as __hasRequestHooks, hasResponseHooks as __hasResponseHooks } from './plugins.js';`
 : `// no plugin declares a runtime hook, so there is no plugins
@@ -4049,20 +4906,44 @@ export function setQuery(query) {
 setLocales(${localesJson}, '${defaultLocale}');
 
 
+// Live store channel: every $store write fans out to the browsers holding an open
+// SSE connection AND (when forked) to sibling workers. The client set lives on
+// globalThis so a dev hot-re-import (a fresh module instance) keeps serving the
+// same live connections. __addStoreClient/__removeStoreClient are called by the
+// host (cli serve worker / devWrap) as SSE connections open and close.
+const __storeClients: Set<any> = (globalThis as any).__rosefd_storeClients || ((globalThis as any).__rosefd_storeClients = new Set());
+function __broadcastStore(name: string, value: unknown): void {
+  if (__storeClients.size === 0) return;
+  const frame = 'event: store\\ndata: ' + JSON.stringify({ name: name, value: value }) + '\\n\\n';
+  for (const res of __storeClients) {
+    try { res.write(frame); } catch { __storeClients.delete(res); }
+  }
+}
+setStoreTransport((name, value) => {
+  __broadcastStore(name, value);
+  if (typeof process !== 'undefined' && typeof process.send === 'function') process.send({ type: 'rosefd:store', name, value });
+});
 if (typeof process !== 'undefined' && typeof process.send === 'function') {
-  setStoreTransport((name, value) => process.send({ type: 'rosefd:store', name, value }));
   process.on('message', (msg) => {
-    if (msg && msg.type === 'rosefd:store') applyStorePatch(msg.name, msg.value);
+    if (msg && msg.type === 'rosefd:store') {
+      applyStorePatch(msg.name, msg.value);
+      __broadcastStore(msg.name, msg.value);
+    }
   });
 }
+export function __addStoreClient(res: any): void { __storeClients.add(res); }
+export function __removeStoreClient(res: any): void { __storeClients.delete(res); }
 
 
 // (the cross-machine seam): the cluster relay above covers ONE machine.
 export function __installStoreTransport(send: (name: string, value: unknown) => void): void {
-  setStoreTransport(send);
+  // Wrap, not replace: a cross-machine transport (a plugin's LISTEN/NOTIFY bus)
+  // still fans out to this machine's live browsers on every patch.
+  setStoreTransport((name, value) => { __broadcastStore(name, value); send(name, value); });
 }
 export function __deliverStorePatch(name: string, value: unknown): void {
   applyStorePatch(name, value);
+  __broadcastStore(name, value);
 }
 
 export { localeList };
@@ -4218,7 +5099,9 @@ function sse(handler: (send: (event: string, data: unknown) => void) => Promise<
     headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "connection": "keep-alive" },
   });
 }
-globalThis.__rosefdExtras = { v, jobs, sse };
+${appUsesNet ? `// The isomorphic runtime's $udp/$tcp reach Node's dgram/net only through these globals; injecting them at server boot is what lets __startNetwork() turn a registered spec into a bound socket.\n(globalThis as any).__rosefd_dgram = __rosefdDgram;\n(globalThis as any).__rosefd_net = __rosefdNet;` : ''}
+${appUsesWs ? `// The isomorphic runtime's $websocket performs the RFC 6455 handshake (sha1) on a node:http upgrade socket; both reach it only through these globals.\n(globalThis as any).__rosefd_http = __rosefdHttp;\n(globalThis as any).__rosefd_crypto = __rosefdCrypto;` : ''}
+globalThis.__rosefdExtras = { v, jobs, sse, udp: $udp, tcp: $tcp, listen: $listen, websocket: $websocket, mqtt: $mqtt };
 ${appUsesAuth ? `
 const auth = {
   hashPassword(password: string): string {
@@ -4321,15 +5204,29 @@ export async function renderPageCached(pathname: string, cookieHeader: string, s
   // Stale-while-revalidate: an EXPIRED entry still answers instantly while one background render refreshes it - the TTL boundary never spikes.
   if (hit && !hit.refreshing) {
     hit.refreshing = true;
+    // BUG.md A: this refresh runs AFTER the live response returned, so the module-global
+    // requestQuery may already belong to a later request. Re-seed it from THIS entry's
+    // search and restore the snapshot afterward, so the cached refresh reflects this query.
+    const __q: Record<string, string> = {};
+    new URLSearchParams(search || '').forEach((v, k) => { __q[k] = v; });
+    const __prevQ = getRequestQuery();
+    setRequestQuery(__q);
     renderPage(pathname).then((fresh: any) => {
+      setRequestQuery(__prevQ);
       if (fresh.status === 200 && !fresh.redirect) {
         __dynCache.set(key, { page: fresh, expires: Date.now() + cfg.seconds * 1000 });
       } else {
         __dynCache.delete(key);
       }
-    }).catch(() => { __dynCache.delete(key); });
+    }).catch(() => { setRequestQuery(__prevQ); __dynCache.delete(key); });
     return hit.page;
   }
+  // Miss: render with this request's query. The caller (edge/cli) already seeded
+  // requestQuery; re-seed from the key's search so the cached entry stays self-consistent
+  // even if a concurrent request overwrote the global during the await.
+  const __q0: Record<string, string> = {};
+  new URLSearchParams(search || '').forEach((v, k) => { __q0[k] = v; });
+  setRequestQuery(__q0);
   const page = await renderPage(pathname);
   if (page.status === 200 && !page.redirect) {
     __dynCache.set(key, { page, expires: Date.now() + cfg.seconds * 1000 });
@@ -4380,7 +5277,11 @@ function toWebRequest(raw, form) {
   if (raw instanceof Request) return raw;
   const init = { method: raw.method || 'GET', headers: new Headers(raw.headers || {}) };
   if (form) init.body = form;
-  return new Request('http://' + (raw.headers?.host || 'localhost') + (raw.url || '/'), init);
+  let u = raw.url || '/';
+  if (u.startsWith('http://') || u.startsWith('https://')) {
+    try { const p = new URL(u); u = p.pathname + p.search; } catch { u = '/'; }
+  }
+  return new Request('http://' + (raw.headers?.host || 'localhost') + u, init);
 }
 
 
@@ -4640,12 +5541,12 @@ async function renderPageIsolated(pathname, form) {
         return { html: '<h1>500</h1><p>Something went wrong rendering this page.</p>' + devDetail, state: '{}', head: [], status: 500, ...docAttrs(pathname) };
       }
       // __route tells the bootstrap which route this document was rendered for.
-      const noJs = route.csr === false;
-      let state = '{}';
-      if (!noJs || actionStatus !== 0) {
-        const s = serializeState();
-        state = '{"__route":' + JSON.stringify(pathname) + (s.length > 2 ? ',' + s.slice(1) : '}');
-      }
+    const noJs = route.csr === false;
+    let state = '{}';
+    if (!noJs || actionStatus !== 0) {
+      const s = serializeState();
+      state = '{"__route":' + JSON.stringify(pathname) + (s.length > 2 ? ',' + s.slice(1) : '}');
+    }
  // Csr ( auto since #29): false when the compiler found nothing in the route's chain that needs the client (or the route asserted csr = false) .
       return { html: rendered.html, state, head: rendered.head, status: actionStatus || 200, csr: route.csr !== false, shell: route.shell !== false, lang: docLang, dir: localeDir(docLang) };
   }
@@ -4740,7 +5641,8 @@ async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
       write(shellOpen);
       let html;
       try {
-        html = extractHead(await route.render([], '')).html;
+        // nonce routes: an un-nonced inline <style> would be CSP-blocked, so strip to markers (applyHead re-injects under the nonce). Otherwise keep the head content in the streamed body so page/layout <style> applies on first paint (no FOUC) and no-JS routes stay styled.
+        html = routeClass(pathname).nonce ? extractHead(await route.render([], '')).html : await route.render([], '');
       } catch (err) {
         console.error('Rose Frame Driver: render failed for', pathname, err instanceof Error ? err.message : err);
         // F10: dev carries the real error in the body here too — the shell
@@ -4759,7 +5661,7 @@ async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
             + (stack ? '<pre style="margin:12px 0 0;color:#8f8f9a">' + stack + '</pre>' : '')
             + '</div>';
         }
-        html = errorPage ? extractHead(await errorPage([], '')).html + devDetail : '<h1>500</h1><p>Something went wrong rendering this page.</p>' + devDetail;
+        html = errorPage ? (routeClass(pathname).nonce ? extractHead(await errorPage([], '')).html : await errorPage([], '')) + devDetail : '<h1>500</h1><p>Something went wrong rendering this page.</p>' + devDetail;
       }
       write(html);
  // Csr: false ( auto since #29): a no-JS route's document ends here - no state script, no inlined bundle.
@@ -4819,7 +5721,8 @@ export { installContextStore };
   } catch { /* types are a convenience: never fail the build over them */ }
 
   await fs.promises.writeFile(path.join(buildDir, 'server-entry.js'), serverEntry);
-  await esbuild.build({
+  await runtimeBuild;
+  const bundleBuilds = runEsbuild(path.join(buildDir, 'server-entry.js'), {
     entryPoints: [path.join(buildDir, 'server-entry.js')],
     bundle: true,
     outfile: path.join(outDir, 'server.js'),
@@ -4827,27 +5730,9 @@ export { installContextStore };
     platform: 'node',
     write: true,
     ...TS_LOADER,
-  });
-
-  await esbuild.build({
-    entryPoints: [(() => {
-      const here = path.dirname(fileURLToPath(import.meta.url));
-      for (const cand of [path.join(here, '..', 'cli', 'prod-server.ts'), path.join(here, '..', 'src', 'cli', 'prod-server.ts')]) {
-        if (fs.existsSync(cand)) return cand;
-      }
-      return path.join(here, '..', 'cli', 'prod-server.ts');
-    })()],
-    bundle: true,
-    outfile: path.join(outDir, 'prod.mjs'),
-    format: 'esm',
-    platform: 'node',
-    write: true,
-    banner: {
-      js: "import { createRequire } from 'node:module'; import { fileURLToPath as __f2p } from 'node:url'; import { dirname as __dn } from 'node:path'; const require = createRequire(import.meta.url); const __filename = __f2p(import.meta.url); const __dirname = __dn(__filename);"
-    },
-    ...TS_LOADER,
-  });
-
+    ...(minify ? { minify: true, keepNames: true } : {}),
+  }, incremental);
+  bundleBuilds.catch(() => {}); // an esbuild failure in the window before the await below must surface there, not as a fatal unhandled rejection
   const clientImports = split ? '' : compiled
     .map((_, i) => ({ i }))
     .filter(({ i }) => !infos[i].isApi && !infos[i].isMiddleware && reachable.has(i))
@@ -4861,6 +5746,7 @@ export { installContextStore };
     .join(',\n  ');
 
   const prefetchMode = compiled.find((c) => c.prefetch)?.prefetch ?? 'all';
+  const lazyHydrationFlag = compiled.find((c) => c.lazyHydration)?.lazyHydration ?? false;
   const vitalsOn = compiled.some((c) => c.vitals === true);
   const vitalsBlock = vitalsOn
     ? `
@@ -4895,7 +5781,21 @@ reportVitals();
 
   const clientEntry = `
 ${clientImports}
-import { state, setState, resumeState, clearRequestState, resetEffects, wire, isolateStateAsync, restoreState, setRefreshHook, clearMounts, flushMounts, adoptCleanups, handlers, setActionDispatcher, setLocales, setLocalePacks, ensureLocale, isLocale, localeDir, setPrefetchOverride, serializeState, setFxOwner, resetContainerFx, esc } from './runtime.js';
+import { state, setState, resumeState, clearRequestState, resetEffects, wire, isolateStateAsync, restoreState, setRefreshHook, clearMounts, flushMounts, adoptCleanups, handlers, setActionDispatcher, setLocales, setLocalePacks, ensureLocale, isLocale, localeDir, setPrefetchOverride, serializeState, setFxOwner, resetContainerFx, esc, applyStorePatch } from './runtime.js';
+${compiled.some((c) => c.usesStore) ? `
+// Live store channel: an app that reads a shared $store() keeps one EventSource to
+// /__rosefd_store. A server-side write ($store.set/update from a network listener,
+// a job, or an action) is pushed here as an {name,value} patch; applyStorePatch
+// writes it into the reactive store box, re-running the wire() effects that render
+// {store.get()} / {#each store.get()}. No store in the app - no connection.
+if (typeof window !== 'undefined' && typeof EventSource !== 'undefined') {
+  try {
+    var __storeEs = new EventSource('/__rosefd_store');
+    __storeEs.addEventListener('store', function (m) {
+      try { var p = JSON.parse(m.data); applyStorePatch(p.name, p.value); } catch (e) {}
+    });
+  } catch (e) {}
+}` : ''}
 
 // I18n: the dictionaries baked at build time - the client renders any PRELOADED locale from the bundle.
 setLocales(${clientLocalesJson}, '${defaultLocale}');
@@ -4904,6 +5804,8 @@ ${hasLang ? `// the default locale, kept beside setLocales' own copy so <html la
 // follow a route that carries no [lang] segment (a non-i18n page)
 const __defLocale = '${defaultLocale}';` : ''}
 ${vitalsOn ? `// the app asked for web-vitals. The import is what keeps\n// reportVitals alive through minification and tree-shaking; the call is one\n// statement at boot, before the first render.\nimport { reportVitals } from './runtime.js';`: ''}
+// Lazy hydration: when the app opts in (export const lazyHydration = true in\n// the root _layout.rose), the bootstrap defers the initial wire() to\n// requestIdleCallback. The flag is set here (module eval runs before the\n// bootstrap's start() call) so the bootstrap can read it without a second channel.
+if (typeof window !== 'undefined') window.__rosefdLazy = ${JSON.stringify(lazyHydrationFlag)};
 // The two pack doors, re-exported for an app that wants to warm a language before its visitor asks for it (ensureLocale) or to feed a dictionary.
 export { ensureLocale, loadLocale } from './runtime.js';
 ${vitalsBlock}
@@ -5299,38 +6201,44 @@ setRefreshHook(async () => {
 });
 `;
   await fs.promises.writeFile(path.join(buildDir, 'client-entry.js'), clientEntry);
-  if (split) {
-    await fs.promises.rm(path.join(outDir, 'chunks'), { recursive: true, force: true });
-    await esbuild.build({
-      entryPoints: [path.join(buildDir, 'client-entry.js')],
-      bundle: true,
-      format: 'esm',
-      platform: 'browser',
-      minify: true,
-      splitting: true,
-      outdir: outDir,
-      entryNames: 'client',
-      chunkNames: 'chunks/[name]-[hash]',
-      write: true,
-      ...TS_LOADER,
-    });
-  } else {
-    await esbuild.build({
-      entryPoints: [path.join(buildDir, 'client-entry.js')],
-      bundle: true,
-      outfile: path.join(outDir, 'client.js'),
-      format: 'esm',
-      platform: 'browser',
-      minify: true,
+  const clientBuild: Promise<esbuild.BuildResult> = split
+    ? (async () => {
+        await rmTreeParallel(path.join(outDir, 'chunks'));
+        return runEsbuild(path.join(buildDir, 'client-entry.js') + ':split', {
+          entryPoints: [path.join(buildDir, 'client-entry.js')],
+          bundle: true,
+          format: 'esm',
+          platform: 'browser',
+          minify: true,
+          splitting: true,
+          outdir: outDir,
+          entryNames: 'client',
+          chunkNames: 'chunks/[name]-[hash]',
+          write: true,
+          ...TS_LOADER,
+        }, incremental);
+      })()
+    : runEsbuild(path.join(buildDir, 'client-entry.js'), {
+        entryPoints: [path.join(buildDir, 'client-entry.js')],
+        bundle: true,
+        outfile: path.join(outDir, 'client.js'),
+        format: 'esm',
+        platform: 'browser',
+        minify: true,
+        write: true,
+        ...TS_LOADER,
+      }, incremental);
+  await Promise.all([bundleBuilds, clientBuild, prodBuild]);
 
-      write: true,
-      ...TS_LOADER,
-    });
-  }
-
-  await fs.promises.writeFile(path.join(outDir, 'mount.js'), MOUNT_ENTRY);
-
-  await fs.promises.rm(buildDir, { recursive: true, force: true });
+  // mount.js shares the document's runtime module: its import carries the same
+  // content-hash URL the shell emits, so a host page using both loads the
+  // runtime exactly once. Unversioned fallback when the bundle is absent.
+  let mountEntry = MOUNT_ENTRY;
+  try {
+    const cb = fs.readFileSync(path.join(outDir, 'client.js'));
+    mountEntry = MOUNT_ENTRY.replace("from '/client.js'", `from '/client.js?v=${fnv1a32(cb)}'`);
+  } catch { /* no client bundle: keep the unversioned import */ }
+  await fs.promises.writeFile(path.join(outDir, 'mount.js'), mountEntry);
 
   const publicDir = path.join(root, 'public');
   if (fs.existsSync(publicDir)) {
@@ -5370,7 +6278,7 @@ setRefreshHook(async () => {
     console.warn(`Rose Frame Driver warning: ${allRoutes.size} routes ship zero JavaScript while their chain contains ${g.why} - ${shown}${more}`);
   }
 
-  return { routes: pages.map(({ info }) => info), bundle: bundleMode };
+  return { routes: pages.map(({ info }) => info), bundle: bundleMode, config };
 }
 
 /** Every .rose file under <root>/src/pages, recursively (layouts and api included). */
