@@ -265,7 +265,14 @@ function externalBootstrap(): string {
   }
   return EXTERNAL_BOOTSTRAP_CACHE.s;
 }
+// The inlined bundle is byte-identical for every document of a build, so the
+// regex scan + slice + concat over the whole client.js is computed once and
+// reused: prerender paid it per route, and a per-request document paid it per
+// request. Keyed by the source string itself (getClientSource() hands back the
+// same instance while dist/client.js is unchanged).
+let inlineScriptCache: { for: string; out: string } | null = null;
 function inlineScript(client: string): string {
+  if (inlineScriptCache !== null && inlineScriptCache.for === client) return inlineScriptCache.out;
   const m = /\bexport\s*\{([^}]*)\}\s*;?\s*$/.exec(client);
   let body = client;
   let aliases = "";
@@ -280,7 +287,9 @@ function inlineScript(client: string): string {
       })
       .join("");
   }
-  return `\n${body}\n${aliases}\n${bootstrap()}`;
+  const out = `\n${body}\n${aliases}\n${bootstrap()}`;
+  inlineScriptCache = { for: client, out };
+  return out;
 }
 /**
  * A fresh CSP nonce: 128 bits from the platform RNG, base64 - the syntax the
