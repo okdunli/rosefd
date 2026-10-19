@@ -48,6 +48,8 @@ export interface TestHandle {
   click(sel: string): Promise<void>;
   /** set an input's value the way a user typing would */
   fill(sel: string, value: string): void;
+  /** dispatch a keydown/keyup on an element (key handlers that are not one of the delegated four need a real event) */
+  key(sel: string, key: string, type?: 'keydown' | 'keyup'): void;
   /** submit a form the way the bootstrap does: one POST, in-place adopt */
   submit(formSel?: string, fields?: Record<string, unknown>): Promise<void>;
   /** call a server action by name, from no event at all */
@@ -171,9 +173,20 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
   const outDir = path.join(dir, 'dist');
   await buildProject(dir, outDir);
 
-  const serverUrl = pathToFileURL(path.join(outDir, 'server.js')).href;
-  const clientUrl = pathToFileURL(path.join(outDir, 'client.js')).href;
-  const mod = await import(serverUrl);
+  // Import through a .mjs copy, not the built .js: tsx (how the CLI and this
+  // suite run) routes a .js import through its CJS interop, i.e. require(esm),
+  // and node refuses that for a module inside the loader's own cycle
+  // (ERR_REQUIRE_CYCLE_MODULE). A .mjs sibling is unambiguously ESM, imports
+  // clean, and is the same bytes - one extra small file in an out dir that is
+  // already temporary (or kept, with --keep, alongside the build).
+  const esmCopy = (file: string): string => {
+    const copy = file.replace(/\.js$/, '.import.mjs');
+    fs.copyFileSync(file, copy);
+    return copy;
+  };
+  const serverImport = esmCopy(path.join(outDir, 'server.js'));
+  const clientImport = esmCopy(path.join(outDir, 'client.js'));
+  const mod = await import(pathToFileURL(serverImport).href);
   const clientSource = fs.readFileSync(path.join(outDir, 'client.js'), 'utf-8');
   let styles = '';
   try {
@@ -207,19 +220,50 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
   const toRequest = (pathname: string, req: TestRequest = {}, body?: FormData) => {
     const headers = new Headers(req.headers ?? {});
     for (const [k, v] of Object.entries(req.cookies ?? {})) headers.append('cookie', `${k}=${v}`);
-    return new Request(`http://localhost${pathname}`, { method: req.method ?? 'GET', headers, body: body ?? undefined });
-    
+    // The fetch standard forbids a body on GET/HEAD; constructing one throws,
+    // so the body rides only on the methods that may carry it.
+    const method = req.method ?? 'GET';
+    const mayBody = method !== 'GET' && method !== 'HEAD';
+    return new Request(`http://localhost${pathname}`, { method, headers, body: mayBody ? (body ?? undefined) : undefined });
   };
 
   // One request through the real server pipeline: middleware first (it can short-circuit - a redirect, an auth wall), then the render.
-  const request = async (pathname: string, req: TestRequest, body?: FormData): Promise<TestResult> => {
-      // the middleware runs first here too - the servers do, and an api
-    if (mod.middleware) {
-      const mw = await mod.runMiddleware(toRequest(pathname, req, body), body);
-      if (mw) return { status: mw.status, html: await mw.text(), state: {}, head: [], lang: 'en', dir: '', document: await mw.text(), redirect: mw.headers.get('location') ?? undefined };
+  const request = async (url: string, req: TestRequest, body?: FormData): Promise<TestResult> => {
+    // The servers split the query off the URL and hand it to the render through
+    // setQuery - $query() reads that object on the server half. A harness
+    // request that kept '?q=' inside the pathname would match no route.
+    const qi = url.indexOf('?');
+    const query = qi >= 0 ? Object.fromEntries(new URLSearchParams(url.slice(qi + 1))) : null;
+    const pathname = qi >= 0 ? url.slice(0, qi) : url;
+    if (qi >= 0) mod.setQuery?.(query!);
+    else mod.setQuery?.({});
+    // The server half has no location in any real deployment, and $query()
+    // uses that fact to read the per-request query instead of the URL. This
+    // process holds BOTH bundles, so a mounted page's location stub (or a
+    // jsdom environment's own) would answer for the server half - hide it for
+    // the render, exactly as a real server never has one.
+    const hadLocation = 'location' in globalThis;
+    const savedLocation = (globalThis as any).location;
+    let hidLocation = false;
+    if (hadLocation) {
+      try {
+        (globalThis as any).location = undefined;
+        hidLocation = true;
+      } catch {
+        /* an unforgeable location (a real browser-like env): leave it be */
+      }
     }
-    const page = await mod.renderPage(pathname, body);
-    return result(page);
+    try {
+      // the middleware runs first here too - the servers do, and an api
+      if (mod.middleware) {
+        const mw = await mod.runMiddleware(toRequest(url, req, body), body);
+        if (mw) return { status: mw.status, html: await mw.text(), state: {}, head: [], lang: 'en', dir: '', document: await mw.text(), redirect: mw.headers.get('location') ?? undefined };
+      }
+      const page = await mod.renderPage(pathname, body);
+      return result(page);
+    } finally {
+      if (hidLocation) (globalThis as any).location = savedLocation;
+    }
   };
 
   
@@ -236,36 +280,60 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
 
     const doc = win.document;
     const app = doc.getElementById('app') ?? doc.body;
-    // Reuse the state element across mounts of the same document: a second one would lose getElementById's first-match race and the client would //.
+    // Reuse the state element across mounts of the same document: a second one
+    // would lose getElementById's first-match race and the client would read
+    // the stale element.
     let stateEl = doc.getElementById('__rosefd_state');
     if (!stateEl) {
       stateEl = doc.createElement('script');
       stateEl.id = '__rosefd_state';
       doc.body.appendChild(stateEl);
     }
-    stateEl.textContent = page.state;
+    // The client's start(container, route, true) resumes from this element's
+    // text as JSON (the browser bootstrap reads the same bytes off the real
+    // document). TestResult.state is the parsed object, so it must be
+    // re-serialized: assigning the object directly stringifies to
+    // "[object Object]", resumeState's parse fails silently, and the client
+    // render falls back to declared initials - a guests list shorter than the
+    // SSR rows shifts every marker index and wire() crashes.
+    stateEl.textContent = typeof page.state === 'string' ? page.state : JSON.stringify(page.state);
     app.innerHTML = page.html;
+
+    // $query() parses location.search on the client half, exactly as it does in
+    // a browser: a route rendered for '/search?q=rose' must see the same query
+    // when the client re-renders it, or the two halves disagree on the rows.
+    const loc = (url: string) => {
+      const i = url.indexOf('?');
+      return { pathname: i >= 0 ? url.slice(0, i) : url, search: i >= 0 ? url.slice(i) : '', href: `http://localhost${url}` };
+    };
 
     const saved = new Map<string, unknown>();
     for (const key of GRAFTED) {
       saved.set(key, (globalThis as any)[key]);
       (globalThis as any)[key] = win[key] ?? (globalThis as any)[key];
     }
-    (globalThis as any).location = { pathname: currentRoute, href: `http://localhost${currentRoute}` };
+    (globalThis as any).location = loc(currentRoute);
     (globalThis as any).fetch = async (url: string | URL, init: any) => {
-      const pathname = String(url).startsWith('http') ? new URL(String(url)).pathname : String(url);
-      if (pathname.startsWith('/locales/') && pathname.endsWith('.json')) {
-        const file = path.join(outDir, pathname.slice(1));
+      const raw = String(url);
+      const parsed = raw.startsWith('http') ? new URL(raw) : null;
+      const target = parsed ? parsed.pathname + parsed.search : raw;
+      const qi = target.indexOf('?');
+      const localePath = qi >= 0 ? target.slice(0, qi) : target;
+      if (localePath.startsWith('/locales/') && localePath.endsWith('.json')) {
+        const file = path.join(outDir, localePath.slice(1));
         if (!fs.existsSync(file)) return { ok: false, json: async () => ({}) };
         return { ok: true, json: async () => JSON.parse(fs.readFileSync(file, 'utf-8')) };
       }
       requests++;
-      const next = await request(pathname, req, init?.body);
+      const next = await request(target, req, init?.body);
       return { ok: next.status < 400, status: next.status, text: async () => next.document };
     };
 
-    const client = await import(clientUrl);
-    await client.start(app, route, true);
+    const client = await import(pathToFileURL(clientImport).href);
+    // start() matches routes by pathname; the query rides location.search for
+    // $query() (the browser bootstrap makes the same split), so a route
+    // mounted as '/search?q=rose' starts on '/search'.
+    await client.start(app, loc(route).pathname, true);
 
     const one = (sel?: string): Element | null => (sel ? doc.querySelector(sel) : app);
     const handle: TestHandle = {
@@ -285,6 +353,15 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
         const el = doc.querySelector(sel) as any;
         if (!el) throw new Error(`rosefd/test: no element matches ${sel}`);
         el.value = value;
+        // A real keystroke fires input; wire()'s bind:value listens for exactly
+        // that event. Setting .value alone leaves the binding blind, so every
+        // fill() ends with the event the browser would have sent.
+        el.dispatchEvent(new win.Event('input', { bubbles: true }));
+      },
+      key: (sel: string, key: string, type: 'keydown' | 'keyup' = 'keydown') => {
+        const el = doc.querySelector(sel) as any;
+        if (!el) throw new Error(`rosefd/test: no element matches ${sel}`);
+        el.dispatchEvent(new win.KeyboardEvent(type, { key, bubbles: true, cancelable: true }));
       },
       submit: async (formSel = 'form', fields?: Record<string, unknown>) => {
         const form = doc.querySelector(formSel) as any;
@@ -299,11 +376,12 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
         for (const [k, v] of Object.entries(fields ?? {})) body.append(k, String(v));
         await client.postForm(body);
       },
-      navigate: async (pathname: string) => {
-        currentRoute = pathname;
-        (globalThis as any).location = { pathname, href: `http://localhost${pathname}` };
-        
-        await client.start(app, pathname, false);
+      navigate: async (url: string) => {
+        currentRoute = url;
+        (globalThis as any).location = loc(url);
+        // start() matches routes by pathname; the query rides location.search
+        // for $query(), the same split the browser's own navigation makes.
+        await client.start(app, loc(url).pathname, false);
       },
       state: () => {
         const el = doc.getElementById('__rosefd_state');
