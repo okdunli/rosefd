@@ -29,8 +29,6 @@ export default [
       if (!url) {
         throw new Error('DATABASE_URL is not set - this driver needs the Postgres connection string');
       }
-      // One dedicated connection for LISTEN (a pooled one would be handed
-      // to someone else between notifications) and the pool for sends.
       const pool = new pg.Pool({ connectionString: url });
       const listener = await pool.connect();
       await listener.query(`LISTEN ${CHANNEL}`);
@@ -38,9 +36,6 @@ export default [
         const { name, value } = JSON.parse(msg.payload);
         store.deliver(name, value);
       });
-      // Every write leaves this worker as a NOTIFY. The sender is a
-      // subscriber too, so it re-applies its own value - idempotent, and
-      // one less special case than the cluster relay's skip-the-writer.
       store.install((name, value) => {
         pool.query('SELECT pg_notify($1, $2)', [CHANNEL, JSON.stringify({ name, value })])
           .catch((err) => console.error('Rose Frame Driver: pg-store notify failed:', err.message));
