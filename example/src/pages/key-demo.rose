@@ -1,0 +1,23 @@
+<script>
+  // `{#key expr}` compiles to a one-element `{#each [expr]}`. Switching the
+  // key tears the body down and builds it again (fresh nodes - an <input>
+  // loses whatever was typed into it); re-rendering with the SAME key leaves
+  // the nodes untouched, so typed text survives. That is the whole contract.
+  let tab = $state<'first' | 'second'>('first');
+
+  function first() { $setState('tab', 'first'); }
+  function second() { $setState('tab', 'second'); }
+</script>
+
+<h1>Key</h1>
+<p>
+  <button on:click={first}>First tab</button>
+  <button on:click={second}>Second tab</button>
+</p>
+
+{#key tab()}
+  <p>Showing the {tab()} tab</p>
+  <input class="scratch" value="">
+{/key}
+
+<p><a href="/">Back to the gate</a></p>

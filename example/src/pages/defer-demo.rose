@@ -1,0 +1,13 @@
+<script>
+  // `{#defer}` is the streaming primitive: the server flushes a loading
+  // placeholder in place of the block and the real content arrives later.
+  // On the client the same block is one {#if} flipped by a timer, so the
+  // adopt path has to line the two up - the placeholder leaves, the content
+  // takes its place, and nothing else on the page moves.
+</script>
+
+<h1>Defer</h1>
+{#defer hold=50}
+  <p>延迟渲染：大块内容</p>
+{/defer}
+<p>页面尾部</p>

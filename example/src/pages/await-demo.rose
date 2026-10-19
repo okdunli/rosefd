@@ -1,0 +1,24 @@
+<script>
+  // `{#await}` renders the pending branch on the server; the then/catch
+  // branches live in the client bundle and flip when the promise settles.
+  // The promise is created once per mount, so which branch a visit lands in
+  // is fixed by the request: ?broken=1 hands the block a rejected promise
+  // and the catch branch is what the client adopts.
+  const broken = $query().broken === '1';
+</script>
+
+<h1>Await</h1>
+
+{#await (broken ? Promise.reject(new Error('the index is gone')) : Promise.resolve(['Protocol v1', 'Protocol v2', 'Protocol v3']))}
+  <p>Reading the index…</p>
+{:then docs}
+  <ul>
+    {#each docs as doc}
+      <li>{doc}</li>
+    {/each}
+  </ul>
+{:catch err}
+  <p>Failed: {err.message}</p>
+{/await}
+
+<p><a href="/">Back to the gate</a></p>
