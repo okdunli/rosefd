@@ -1,4 +1,9 @@
 
+// The LoRaWAN parser lives in its own module (it is pure and large enough to
+// deserve one) but reaches pages through this module's surface.
+export { parseLoRaWAN } from './lorawan.js';
+export type { LoRaWANFrame, LoRaWANDataFrame, LoRaWANJoinRequest, LoRaWANJoinAccept, LoRaWANMessageType } from './lorawan.js';
+
 // === Reactive Primitives ===
 type Subscriber = () => void;
 type Cleanup = () => void;
@@ -9,6 +14,27 @@ let currentEffect: (() => void) | null = null;
 // F43: while an $effect body runs, every signal read lands here (the entry OBJECT).
 let trackingDeps: Set<SignalEntry> | null = null;
 
+/**
+ * Run fn with dependency tracking off. A block's BODY render reads the very
+ * signals its own children subscribe to: running it inside the block effect's
+ * tracking window subscribes the BLOCK to every inner signal too, so one inner
+ * write rebuilds the whole {#if}/slot body (node identity lost, work
+ * multiplied) on top of the child's own fine-grained patch. The gating read
+ * (the condition, the items array) stays tracked; the body render does not.
+ */
+function untrack<T>(fn: () => T): T {
+  const prevEffect = currentEffect;
+  const prevTracking = trackingDeps;
+  currentEffect = null;
+  trackingDeps = null;
+  try {
+    return fn();
+  } finally {
+    currentEffect = prevEffect;
+    trackingDeps = prevTracking;
+  }
+}
+
 // Trade-off: global signal map, shared across all inlined modules
 let signalMap: Map<string, SignalEntry> =
   (globalThis as any).__rosefd_signalMap ?? new Map();
@@ -16,8 +42,9 @@ let signalMap: Map<string, SignalEntry> =
 
 // One get-or-create helper shared by state / setState / resumeState.
 function entry(key: string, initial: unknown): { value: unknown; subs: Set<Subscriber> } {
-  const e = signalMap.get(key) ?? { value: initial, subs: new Set<Subscriber>() };
-  signalMap.set(key, e);
+  const map = renderMaps().signals;
+  const e = map.get(key) ?? { value: initial, subs: new Set<Subscriber>() };
+  map.set(key, e);
   return e;
       // F43: $effect dep capture
 }
@@ -39,13 +66,23 @@ export function state<T>(key: string, initial: T): [() => T, (v: T) => void] {
   const setter = (v: T) => {
     // F36: a function value is a functional update - it receives the current value and returns the next one ($setState('n', (x) => x + 1)).
     const next = (typeof v === 'function' ? (v as (cur: T) => T)(e.value) : v) as T;
+    // A write of the value the signal already holds changes nothing: skip the
+    // fan-out. Object.is, not ==, so NaN writes are (correctly) still news and
+    // -0/+0 writes stay distinguishable. Skipping is what keeps {#key}'s
+    // promise - a re-render carrying the same key must leave the body's nodes
+    // alone, and a same-value write that ran the effect would rebuild them.
+    if (Object.is(next, e.value)) return;
     e.value = next;
     // F43: notify UNTRACKED. Subscribers were subscribed by whoever owns them; a write's fan-out must not hand out new subscriptions.
     const prevEffect = currentEffect;
     const prevTracking = trackingDeps;
     currentEffect = null;
     trackingDeps = null;
-    e.subs.forEach((fn: Subscriber) => fn());
+    // A snapshot, not the live Set: an effect that runs here may subscribe
+    // another effect (a nested block's first run), and a live Set's iterator
+    // would visit that newcomer in the SAME pass - the nested effect runs
+    // twice, and its second run rebuilds nodes the first run just placed.
+    for (const fn of [...e.subs] as Subscriber[]) fn();
     /* a throwing effect must not kill the route */
     currentEffect = prevEffect;
     trackingDeps = prevTracking;
@@ -57,7 +94,7 @@ export function state<T>(key: string, initial: T): [() => T, (v: T) => void] {
 }
 
 export function hasState(key: string): boolean {
-  return signalMap.has(key);
+  return renderMaps().signals.has(key);
       /* a stale cleanup must not kill the route */
 }
 
@@ -65,23 +102,28 @@ export function hasState(key: string): boolean {
 let seededKeys = new Set<string>();
 
 export function isSeeded(key: string): boolean {
-  return seededKeys.has(key);
-      
+  return renderMaps().seeded.has(key);
+
 }
 
 export function markSeeded(key: string): void {
-  seededKeys.add(key);
+  renderMaps().seeded.add(key);
 }
 
 export function setState<T>(key: string, value: T): void {
   const e = entry(key, value);
+  // Same two rules as the signal's own setter: a write of the value already
+  // held changes nothing (Object.is, so NaN and -0/+0 stay honest), and the
+  // fan-out walks a snapshot - an effect running here may subscribe another
+  // one, and a live Set's iterator would visit that newcomer in the same pass.
+  if (Object.is(value, e.value)) return;
   e.value = value;
   // F43: notify untracked (same reason as the per-render setter above).
   const prevEffect = currentEffect;
   const prevTracking = trackingDeps;
   currentEffect = null;
   trackingDeps = null;
-  e.subs.forEach((fn: Subscriber) => fn());
+  for (const fn of [...e.subs] as Subscriber[]) fn();
   currentEffect = prevEffect;
   trackingDeps = prevTracking;
   if (persistedKeys.has(key)) writeStorage(key, value);
@@ -160,7 +202,7 @@ export function resetContainerFx(container: object): void {
   }
   const keys = keysByOwner.get(container);
   if (keys) {
-    keys.forEach((k: string) => signalMap.delete(k));
+    keys.forEach((k: string) => renderMaps().signals.delete(k));
     keysByOwner.delete(container);
   }
   renderMaps().data.clear();
@@ -179,7 +221,10 @@ export function effect(fn: () => void): Cleanup {
   fn();
   currentEffect = prev;
   const cleanup: Cleanup = () => {
-    signalMap.forEach((e: { subs: Set<Subscriber> }) => e.subs.delete(wrapped));
+    renderMaps().signals.forEach((e: { subs: Set<Subscriber> }) => e.subs.delete(wrapped));
+    // $store() boxes live in a separate map: detach them too, or a live store
+    // patch keeps re-running an unmounted effect (stale render + leak).
+    STORES.forEach((e: { subs: Set<Subscriber> }) => e.subs.delete(wrapped));
     fxSet().delete(cleanup);
   };
   fxSet().add(cleanup);
@@ -307,8 +352,15 @@ export function ifMark(
       snap = null;
       return null;
     }
+    // The snapshot is only sound for a body with no reactive children. A body
+    // that carries markers (a nested {#if}/{#each}/text) re-renders differently
+    // every time its inner state moves: caching its html would replay a stale
+    // snapshot whose marker ids point at the wrong closes - the enclosing
+    // block's adopt would insert nodes wired to the wrong effects.
     if (!snap) {
-      snap = { html: String(fn(scope, closes)), closes };
+      const html = String(untrack(() => fn(scope, closes)));
+      snap = html.includes('\u27e6') ? null : { html, closes };
+      return { html, closes };
     }
     return snap;
   }) - 1;
@@ -331,9 +383,12 @@ const EACH_HTML_NORM = (h: string): string => h.replace(/\u27e6\/?[a-z]+:\d+\u27
 const normHtml = (row: EachRow): string => (row.norm ??= EACH_HTML_NORM(row.html));
 
 export function eachMark(closes: Close[], items: Close, fn: (s: unknown, c: Close[]) => unknown, key?: (s: unknown, vi: number) => unknown): string {
-  const i = closes.push(() => (items() as unknown[]).map((v, vi) => {
-    return { html: String(fn(v, closes, vi)), closes, scope: v, keyed: !!key, key: key ? String(key(v, vi)) : undefined };
-  })) - 1;
+  const i = closes.push(() => {
+    const list = items() as unknown[];
+    return untrack(() => list.map((v, vi) => {
+      return { html: String(fn(v, closes, vi)), closes, scope: v, keyed: !!key, key: key ? String(key(v, vi)) : undefined };
+    }));
+  }) - 1;
   let h = `<!--\u27e6l:${i}\u27e7-->`;
   for (const r of closes[i]() as Array<{ html: string }>) h += r.html;
   return h + `<!--\u27e6/l:${i}\u27e7-->`;
@@ -384,9 +439,9 @@ export function slotBlockMark(
   if (!hit) return '';
   const i = closes.push(() => {
     if (!hit) return null;
-    return { html: String(hit.fn(hit.o, closes)), closes, scope: hit.o };
+    return { html: String(untrack(() => hit.fn(hit.o, closes))), closes, scope: hit.o };
   }) - 1;
-  return `<!--\u27e6i:${i}\u27e7-->` + String(hit.fn(hit.o, closes)) + `<!--\u27e6/i:${i}\u27e7-->`;
+  return `<!--\u27e6i:${i}\u27e7-->` + String(untrack(() => hit.fn(hit.o, closes))) + `<!--\u27e6/i:${i}\u27e7-->`;
 }
 
 const MARK_RE = /^\u27e6([milh]):(\d+)\u27e7$/;
@@ -658,13 +713,35 @@ export function wire(root: Node, closes: Array<unknown>, scope?: unknown): Clean
       const st = anchor as unknown as { __st?: { nodes: Node[]; disp: Cleanup }; __ever?: boolean };
       weff(() => {
         if (st.__st) {
-          st.__st.nodes.forEach((n) => (n as ChildNode).remove());
+          // Range delete, not the recorded node list: an inner block's effect
+          // may have inserted rows between these markers after the last run,
+          // and those nodes belong to no outer snapshot - a list-based remove
+          // strands them in the document (the branch's old content lives on
+          // next to the new).
+          let n = anchor.nextSibling;
+          while (n && n !== end) {
+            const nx = n.nextSibling;
+            n.remove();
+            n = nx;
+          }
           st.__st.disp();
           st.__st = undefined;
         }
         const r = (closes[idx] as (s?: unknown) => unknown)(scope) as { html: string; closes: unknown[] } | null;
         if (!r) {
-          st.__ever = true;
+          // The condition went false. The first run must still clear whatever
+          // the SSR flush (or an enclosing block's re-render) left between the
+          // markers: an early return here strands those nodes in the document
+          // forever - they belong to a branch that no longer renders.
+          if (!st.__ever) {
+            st.__ever = true;
+            let n = anchor.nextSibling;
+            while (n && n !== end) {
+              const nx = n.nextSibling;
+              n.remove();
+              n = nx;
+            }
+          }
           return;
         }
         let frag: DocumentFragment;
@@ -1375,10 +1452,10 @@ export async function aggregate<R extends Record<string, () => Promise<unknown>>
 }
 
 export function clearRequestState(): void {
-  signalMap.clear();
+  renderMaps().signals.clear();
   renderMaps().data.clear();
   pendingDeltas.clear();
-  seededKeys = new Set();
+  renderMaps().seeded.clear();
   bffCache.clear();
 }
 
@@ -1397,22 +1474,24 @@ export function clearRequestState(): void {
  * (reading 'bodyFix')", a 500 that hits a cold route and clears on refresh.
  *
  * Isolating here makes concurrent renders correct rather than merely unlikely.
- * Two different mechanisms, because they fail differently: signalMap is
- * swapped and restored (it is synchronous to read, and its entries are keyed
- * per state key), while dataCache rides the async chain instead - see
- * renderMaps() for why a swap there was not isolation at all.
+ * The signal map and the seeded-key set are swapped on the resolved render maps
+ * (renderMaps()), so under a context store each render chain gets its own pair;
+ * without a store the swap is the old process-wide one, correct for the
+ * single-render fallback. dataCache needs no swap at all under a store - it
+ * already rides the async chain; see renderMaps().
  */
 export async function isolateRender<T>(fn: () => Promise<T>): Promise<T> {
-  const savedSignals = signalMap;
-  const savedSeeded = seededKeys;
-  signalMap = new Map();
-  seededKeys = new Set();
-  renderMaps().data.clear();
+  const maps = renderMaps();
+  const savedSignals = maps.signals;
+  const savedSeeded = maps.seeded;
+  maps.signals = new Map();
+  maps.seeded = new Set();
+  maps.data.clear();
   try {
     return await fn();
   } finally {
-    signalMap = savedSignals;
-    seededKeys = savedSeeded;
+    maps.signals = savedSignals;
+    maps.seeded = savedSeeded;
   }
 }
 
@@ -1430,6 +1509,12 @@ export function $query(): Record<string, string> {
 /** The per-request query object - the servers call this before every render. */
 export function setRequestQuery(q: Record<string, string>): void {
   requestQuery = q;
+}
+
+/** Read the current per-request query (the SWR background refresh snapshots it so a
+ *  concurrent request's setRequestQuery cannot leak the wrong query into a cached refresh). */
+export function getRequestQuery(): Record<string, string> {
+  return requestQuery;
 }
 
 /** The query of the route a prefetch is rendering, or null outside one. */
@@ -1472,8 +1557,8 @@ let contextStore: ContextStore | null = null;
  * correct anyway.
  */
 const RENDER_MAPS = Symbol('renderMaps');
-type RenderMaps = { data: Map<string, Promise<unknown>>; signals: Map<string, unknown>; seeded: Set<string> };
-let fallbackRenderMaps: RenderMaps = { data: new Map(), signals: new Map(), seeded: new Set() };
+type RenderMaps = { data: Map<string, Promise<unknown>>; signals: Map<string, SignalEntry>; seeded: Set<string> };
+let fallbackRenderMaps: RenderMaps = { data: new Map(), signals: signalMap, seeded: seededKeys };
 
 function renderMaps(): RenderMaps {
   const scoped = contextStore?.getStore();
@@ -1552,24 +1637,28 @@ export function runWithContext<T>(fn: () => T): T {
 export async function isolateStateAsync<T>(
   fn: () => Promise<T>
 ): Promise<{ result: T; state: Map<string, SignalEntry>; mounts: Array<() => void>; cleanups: Set<Cleanup> }> {
-  const savedSignals = signalMap;
+  const maps = renderMaps();
+  const savedSignals = maps.signals;
+  const savedSeeded = maps.seeded;
   const savedDeltas = new Map(pendingDeltas);
   pendingDeltas.clear();
   const savedMounts = mountQueue.splice(0, mountQueue.length);
   const savedCleanups = new Set(cleanups);
   cleanups.clear();
-  signalMap = new Map();
-  renderMaps().data.clear();
+  maps.signals = new Map();
+  maps.seeded = new Set();
+  maps.data.clear();
   try {
     const result = await fn();
     return {
       result,
-      state: signalMap,
+      state: maps.signals,
       mounts: mountQueue.splice(0, mountQueue.length),
       cleanups: new Set(cleanups),
     };
   } finally {
-    signalMap = savedSignals;
+    maps.signals = savedSignals;
+    maps.seeded = savedSeeded;
     pendingDeltas.clear();
     savedDeltas.forEach((d, k) => pendingDeltas.set(k, d));
     mountQueue.splice(0, 0, ...savedMounts);
@@ -1580,13 +1669,14 @@ export async function isolateStateAsync<T>(
 
 /** Adopt a prefetched route's signal entries (objects keep their subs). */
 export function restoreState(entries: Map<string, SignalEntry>): void {
-  signalMap.clear();
-  entries.forEach((e: SignalEntry, k: string) => signalMap.set(k, e));
+  const map = renderMaps().signals;
+  map.clear();
+  entries.forEach((e: SignalEntry, k: string) => map.set(k, e));
 }
 
 export function serializeState(): string {
   const obj: Record<string, unknown> = {};
-  signalMap.forEach((v: { value: unknown }, k: string) => {
+  renderMaps().signals.forEach((v: { value: unknown }, k: string) => {
     obj[k] = v.value;
   });
   return JSON.stringify(obj);
@@ -1599,12 +1689,12 @@ export function resumeState(json: string): void {
       const [keys, values] = parsed as [string[], unknown[]];
       for (let i = 0; i < keys.length; i++) {
         entry(keys[i], values[i]).value = values[i];
-        seededKeys.add(keys[i]);
+        renderMaps().seeded.add(keys[i]);
       }
     } else if (parsed && typeof parsed === 'object') {
       Object.entries(parsed as Record<string, unknown>).forEach(([k, v]) => {
         entry(k, v).value = v;
-        seededKeys.add(k);
+        renderMaps().seeded.add(k);
       });
     }
   } catch {
@@ -1847,8 +1937,26 @@ export function $t(key: string, vars?: Record<string, string | number>): string 
   return out;
 }
 
-const STORES = new Map<string, { value: unknown }>();
+const STORES = new Map<string, { value: unknown; subs: Set<Subscriber> }>();
 let storeTransport: ((name: string, value: unknown) => void) | null = null;
+
+// A store write (or an applied patch) fans out to whoever read the store inside a
+// tracked scope - the wire() effects that render {store.get()} / {#each store.get()}.
+// Notify UNTRACKED, exactly like the signal setter: a write must not hand out new
+// subscriptions, and a throwing effect must not kill the route.
+function notifyStoreSubs(box: { subs: Set<Subscriber> }): void {
+  if (box.subs.size === 0) return;
+  const prevEffect = currentEffect;
+  const prevTracking = trackingDeps;
+  currentEffect = null;
+  trackingDeps = null;
+  // Snapshot, for the same reason as the signal setter: an effect running
+  // here can subscribe another one (a nested block's first run), and a live
+  // Set's iterator would visit that newcomer in the same pass.
+  for (const fn of [...box.subs] as Subscriber[]) fn();
+  currentEffect = prevEffect;
+  trackingDeps = prevTracking;
+}
 
 /**
  * Install the cross-process transport. The generated server entry wires the
@@ -1863,7 +1971,9 @@ export function setStoreTransport(fn: ((name: string, value: unknown) => void) |
  * calls this; a store nobody opened yet is ignored - it has no reader). */
 export function applyStorePatch(name: string, value: unknown): void {
   const entry = STORES.get(name);
-  if (entry) entry.value = value;
+  if (!entry) return;
+  entry.value = value;
+  notifyStoreSubs(entry);
 }
 
 /**
@@ -1879,21 +1989,651 @@ export function applyStorePatch(name: string, value: unknown): void {
 export function $store<T>(name: string, initial: T): { get(): T; set(v: T): void; update(fn: (v: T) => T): void } {
   let entry = STORES.get(name);
   if (!entry) {
-    entry = { value: initial };
+    entry = { value: initial, subs: new Set<Subscriber>() };
     STORES.set(name, entry);
   }
   const box = entry;
   return {
-    get: () => box.value as T,
+    get: () => {
+      if (currentEffect) {
+        box.subs.add(currentEffect);
+        if (trackingDeps) trackingDeps.add(box as unknown as SignalEntry);
+      }
+      return box.value as T;
+    },
     set: (v: T) => {
       box.value = v;
+      notifyStoreSubs(box);
       storeTransport?.(name, v);
     },
     update: (fn: (v: T) => T) => {
       box.value = fn(box.value as T);
+      notifyStoreSubs(box);
       storeTransport?.(name, box.value);
     },
   };
+}
+
+// === Network listeners (isomorphic) ===
+// $udp / $tcp / $listen / $websocket let an app open a socket and react to the
+// outside world (LoRa gateways, MQTT-ish feeds, raw TCP devices, live dashboards)
+// from inside a rosefd app. They only REGISTER a spec here; the host binds them
+// via __startNetwork() at serve-worker boot - so a build, a prerender, or a dev
+// hot-re-import never opens a socket. The registries live on globalThis: a dev
+// re-import re-registers specs against the same live handles.
+//
+// A page's <script> runs per render, so the same key re-registers on every
+// request. Re-registration therefore SWAPS the callbacks on the live handle
+// (opts are read dynamically at event time) instead of closing the socket: no
+// per-request churn, and a dev hot-reload's fresh closures take over immediately
+// instead of leaving stale ones bound. On the client every handle is an inert
+// no-op, so a page whose <script> opens a listener hydrates without a
+// ReferenceError.
+type NetOpts = Record<string, unknown>;
+const __netSpecs: { kind: string; port: number; host?: string; opts: NetOpts }[] =
+  (globalThis as any).__rosefd_netSpecs || ((globalThis as any).__rosefd_netSpecs = []);
+const __netHandles: any[] = (globalThis as any).__rosefd_netHandles || ((globalThis as any).__rosefd_netHandles = []);
+/** key ('kind:port:host') -> live handle. A Map, not a Set: re-registering a key (per-request render or dev hot re-import) swaps the callbacks in place. */
+const __netBound: Map<string, any> = (globalThis as any).__rosefd_netBound || ((globalThis as any).__rosefd_netBound = new Map());
+
+function __netBind(spec: { kind: string; port: number; host?: string; opts: NetOpts }): void {
+  const key = spec.kind + ':' + spec.port + ':' + (spec.host || '');
+  const prev = __netBound.get(key);
+  if (prev) {
+    // Live handle already bound: adopt the newest callbacks, keep the socket.
+    prev.opts = spec.opts || {};
+    return;
+  }
+  const o = spec.opts || {};
+  if (spec.kind === 'udp') {
+    const dg = (globalThis as any).__rosefd_dgram;
+    if (!dg) return;
+    const handle = { opts: o, sock: null as any };
+    const sock = dg.createSocket('udp4');
+    handle.sock = sock;
+    sock.on('message', (msg: Buffer, rinfo: unknown) => (handle.opts.onMessage as (m: Buffer, r: unknown) => void)?.(msg, rinfo));
+    sock.on('error', (err: Error) => { if (handle.opts.onError) (handle.opts.onError as (e: Error) => void)(err); else console.error('[rosefd] UDP error:', err); });
+    sock.bind(spec.port, spec.host || '0.0.0.0');
+    __netHandles.push(sock);
+    __netBound.set(key, handle);
+  } else if (spec.kind === 'tcp') {
+    const nt = (globalThis as any).__rosefd_net;
+    if (!nt) return;
+    const handle = { opts: o, srv: null as any };
+    const idleMs = ((o.idleTimeout as number) ?? 0) * 1000;
+    const srv = nt.createServer((socket: any) => {
+      (handle.opts.onConnection as (s: unknown) => void)?.(socket);
+      if (idleMs > 0) {
+        // A device that connects and goes silent would hold the fd forever;
+        // an idle window re-armed on every inbound byte bounds that.
+        socket.setTimeout(idleMs);
+        socket.on('timeout', () => {
+          (handle.opts.onIdle as ((s: unknown) => void) | undefined)?.(socket);
+          socket.destroy();
+        });
+      }
+      socket.on('data', (data: Buffer) => {
+        if (idleMs > 0) socket.setTimeout(idleMs);
+        (handle.opts.onData as (s: unknown, d: Buffer) => void)?.(socket, data);
+      });
+      socket.on('error', () => {});
+    });
+    handle.srv = srv;
+    srv.on('error', (err: Error) => console.error('[rosefd] TCP server error:', err));
+    srv.listen(spec.port, spec.host || '0.0.0.0');
+    __netHandles.push(srv);
+    __netBound.set(key, handle);
+  } else if (spec.kind === 'ws') {
+    const http = (globalThis as any).__rosefd_http;
+    const cryptoMod = (globalThis as any).__rosefd_crypto;
+    if (!http || !cryptoMod) return;
+    const clients = new Set<any>();
+    const handle = {
+      opts: o,
+      clients: () => Array.from(clients),
+      broadcast: (data: unknown) => { for (const c of clients) c.send(data); },
+      close: () => {
+        for (const c of Array.from(clients)) c.close();
+        if (handle.__pingTimer) { clearInterval(handle.__pingTimer); handle.__pingTimer = null; }
+        try { srv.close(); } catch { /* already gone */ }
+      },
+      __pingTimer: null as ReturnType<typeof setInterval> | null,
+    };
+    const srv = http.createServer((_req: unknown, res: any) => { res.writeHead(426, { 'content-type': 'text/plain' }); res.end('Upgrade Required'); });
+    srv.on('upgrade', (req: any, socket: any) => {
+      const opts = handle.opts;
+      if (String(req.headers.upgrade || '').toLowerCase() !== 'websocket' || !req.headers['sec-websocket-key']) { socket.destroy(); return; }
+      const path = String(req.url || '/').split('?')[0];
+      if (opts.path && path !== opts.path) { socket.destroy(); return; }
+      const accept = cryptoMod.createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      try {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+      } catch { socket.destroy(); return; }
+      socket.setNoDelay(true);
+      socket.setTimeout(0); // an upgraded socket is a long-lived channel: no request timeout
+      const wrapped = __wsWrap(socket, clients, handle);
+      clients.add(wrapped);
+      (opts.onConnection as (ws: unknown) => void)?.(wrapped);
+    });
+    srv.on('error', (err: Error) => { if (handle.opts.onError) (handle.opts.onError as (e: Error) => void)(err); else console.error('[rosefd] WebSocket server error:', err); });
+    srv.listen(spec.port, spec.host || '0.0.0.0');
+    // Keepalive: a half-open peer (network partition, crashed device) never
+    // sends FIN, so its socket would sit in `clients` forever and every
+    // broadcast would write into the void. Each tick pings the live-looking
+    // clients and destroys the ones that failed to answer the previous ping.
+    const pingInterval = ((o.pingInterval as number) ?? 30);
+    if (pingInterval > 0) {
+      handle.__pingTimer = setInterval(() => {
+        for (const c of Array.from(clients)) {
+          const sock = c.__sock;
+          if (!sock || sock.destroyed) { clients.delete(c); continue; }
+          if (c.__alive === false) { try { sock.destroy(); } catch { /* already gone */ } clients.delete(c); continue; }
+          c.__alive = false;
+          try { sock.write(__wsEncodeFrame(9, Buffer.alloc(0))); } catch { /* already gone */ }
+        }
+      }, Math.max(1000, pingInterval * 1000));
+    }
+    __netHandles.push(handle);
+    __netBound.set(key, handle);
+  } else if (spec.kind === 'mqtt') {
+    const nt = (globalThis as any).__rosefd_net;
+    if (!nt) return;
+    const client = __mqttConnect(nt, spec.port, spec.host || 'localhost', o);
+    __netHandles.push(client);
+    __netBound.set(key, client);
+  }
+}
+function __netReg(kind: string, port: number, host: string | undefined, opts: NetOpts): void {
+  const spec = { kind, port, host, opts };
+  __netSpecs.push(spec);
+  if ((globalThis as any).__rosefd_netStarted === true) __netBind(spec);
+}
+/** Drop every pending spec for a key and close its live handle (app-level close()). */
+function __netUnreg(kind: string, port: number, host: string | undefined): void {
+  const key = kind + ':' + port + ':' + (host || '');
+  const h = __netBound.get(key);
+  if (h) {
+    const live = (h as { sock?: { close?: () => void }; srv?: { close?: () => void }; close?: () => void });
+    try { (live.close || live.sock?.close || live.srv?.close)?.call(live); } catch { /* already gone */ }
+    __netBound.delete(key);
+  }
+  for (let i = __netSpecs.length - 1; i >= 0; i--) {
+    const s = __netSpecs[i];
+    if (s.kind === kind && s.port === port && (s.host || '') === (host || '')) __netSpecs.splice(i, 1);
+  }
+}
+/** Bind every registered listener. Called once at serve-worker boot by the host. */
+export function __startNetwork(): void {
+  (globalThis as any).__rosefd_netStarted = true;
+  for (const spec of __netSpecs) __netBind(spec);
+}
+/** Close every bound listener. Called on worker shutdown. */
+export function __stopNetwork(): void {
+  for (const h of __netHandles) {
+    const live = h as { close?: () => void };
+    try { live.close?.(); } catch { /* already gone */ }
+  }
+  __netHandles.length = 0;
+  __netBound.clear();
+}
+
+// === WebSocket server (RFC 6455, zero-dependency) ===
+// Minimal but complete enough for dashboards and device feeds: handshake,
+// text/binary frames, continuation reassembly, ping/pong, close handshake.
+// No extensions, no permessage-deflate - deliberately.
+const __WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/** Parse as many complete frames as the buffer holds; return the tail (partial frame) for the next chunk. */
+function __wsParseFrames(buf: Buffer): { frames: { fin: boolean; opcode: number; payload: Buffer }[]; rest: Buffer } {
+  const frames: { fin: boolean; opcode: number; payload: Buffer }[] = [];
+  let off = 0;
+  while (off + 2 <= buf.length) {
+    const b0 = buf[off];
+    const b1 = buf[off + 1];
+    const fin = (b0 & 0x80) !== 0;
+    const opcode = b0 & 0x0f;
+    const masked = (b1 & 0x80) !== 0;
+    let len = b1 & 0x7f;
+    let p = off + 2;
+    if (len === 126) {
+      if (off + 4 > buf.length) break;
+      len = buf.readUInt16BE(p);
+      p += 2;
+    } else if (len === 127) {
+      if (off + 10 > buf.length) break;
+      len = buf.readUInt32BE(p) * 4294967296 + buf.readUInt32BE(p + 4);
+      p += 8;
+    }
+    const maskLen = masked ? 4 : 0;
+    if (p + maskLen + len > buf.length) break;
+    let payload = buf.slice(p + maskLen, p + maskLen + len);
+    if (masked) {
+      const mask = buf.slice(p, p + 4);
+      const out = Buffer.allocUnsafe(len);
+      for (let i = 0; i < len; i++) out[i] = payload[i] ^ mask[i & 3];
+      payload = out;
+    }
+    frames.push({ fin, opcode, payload });
+    off = p + maskLen + len;
+  }
+  return { frames, rest: off > 0 ? buf.slice(off) : buf };
+}
+
+/** Encode one server->client frame (never masked, FIN always set for our single-frame sends). */
+function __wsEncodeFrame(opcode: number, payload: Buffer): Buffer {
+  const len = payload.length;
+  let header: Buffer;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeUInt32BE(0, 2);
+    header.writeUInt32BE(len, 6);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+/** Wrap an upgraded raw socket into the plan's WebSocket surface: send/close/on + message reassembly. Callbacks are read from the handle's opts at event time so a re-registration swaps them live. */
+function __wsWrap(socket: any, clients: Set<any>, handle: { opts: NetOpts }): any {
+  const listeners: Record<string, ((arg: unknown) => void)[]> = {};
+  const emit = (ev: string, arg: unknown) => { for (const fn of listeners[ev] || []) fn(arg); };
+  let msgOpcode = 0;
+  let parts: Buffer[] = [];
+  const wrapped = {
+    __sock: socket,
+    __alive: true, // flipped false by each keepalive ping; any inbound frame (pong or data) proves the peer is there
+    remoteAddress: socket.remoteAddress,
+    send: (data: unknown) => {
+      if (socket.destroyed) return;
+      let opcode = 1;
+      let payload: Buffer;
+      if (typeof data === 'string') { opcode = 1; payload = Buffer.from(data, 'utf8'); }
+      else if (Buffer.isBuffer(data)) { opcode = 2; payload = data; }
+      else { opcode = 1; payload = Buffer.from(String(data), 'utf8'); }
+      socket.write(__wsEncodeFrame(opcode, payload));
+    },
+    close: () => {
+      if (socket.destroyed) return;
+      try { socket.write(__wsEncodeFrame(8, Buffer.from([0x03, 0xe8]))); } catch { /* already gone */ }
+      socket.end();
+    },
+    on: (ev: string, fn: (arg: unknown) => void) => { (listeners[ev] || (listeners[ev] = [])).push(fn); },
+  };
+  (socket as any).__wsBuf = Buffer.alloc(0);
+  socket.on('data', (chunk: Buffer) => {
+    const sock = socket as any;
+    sock.__wsBuf = sock.__wsBuf.length ? Buffer.concat([sock.__wsBuf, chunk]) : chunk;
+    const { frames, rest } = __wsParseFrames(sock.__wsBuf as Buffer);
+    sock.__wsBuf = rest;
+    for (const f of frames) {
+      if (f.opcode === 8) {
+        wrapped.close();
+      } else if (f.opcode === 9) {
+        wrapped.__alive = true;
+        try { socket.write(__wsEncodeFrame(10, f.payload)); } catch { /* already gone */ }
+      } else if (f.opcode === 10) {
+        wrapped.__alive = true; // pong: the peer answered the keepalive ping
+      } else if (f.opcode === 1 || f.opcode === 2) {
+        wrapped.__alive = true; // inbound traffic is proof of life too
+        if (msgOpcode !== 0) { socket.destroy(); return; } // protocol error: new data frame mid-message
+        msgOpcode = f.opcode;
+        parts = [f.payload];
+        if (f.fin) { const msg = Buffer.concat(parts); const op = msgOpcode; msgOpcode = 0; parts = []; emit('message', op === 1 ? msg.toString('utf8') : msg); (handle.opts.onMessage as ((...a: unknown[]) => void) | undefined)?.(wrapped, op === 1 ? msg.toString('utf8') : msg); }
+      } else if (f.opcode === 0) {
+        if (msgOpcode === 0) { socket.destroy(); return; } // protocol error: continuation without a start
+        parts.push(f.payload);
+        if (f.fin) { const msg = Buffer.concat(parts); const op = msgOpcode; msgOpcode = 0; parts = []; emit('message', op === 1 ? msg.toString('utf8') : msg); (handle.opts.onMessage as ((...a: unknown[]) => void) | undefined)?.(wrapped, op === 1 ? msg.toString('utf8') : msg); }
+      }
+    }
+  });
+  socket.on('close', () => { clients.delete(wrapped); emit('close', null); (handle.opts.onClose as ((...a: unknown[]) => void) | undefined)?.(wrapped); });
+  socket.on('error', (e: Error) => emit('error', e));
+  return wrapped;
+}
+
+const __NOOP_NET = {
+  send: () => {}, close: () => {}, write: () => {}, end: () => {}, destroy: () => {}, on: () => {},
+  joinMulticast: () => {}, leaveMulticast: (): void => {},
+  address: () => ({ port: 0, host: 'localhost', family: 'IPv4' }),
+};
+const __NOOP_WS = (port: number, host?: string) => ({
+  close: (): void => {},
+  clients: (): unknown[] => [],
+  broadcast: (): void => {},
+  address: () => ({ port, host: host || '0.0.0.0' }),
+});
+
+export function $udp(port: number, opts: NetOpts = {}): any {
+  if (typeof document === 'undefined') __netReg('udp', port, opts.host as string | undefined, opts);
+  return { ...__NOOP_NET, address: () => ({ port, host: (opts.host as string) || '0.0.0.0', family: 'IPv4' }) };
+}
+
+export function $tcp(portOrHost: number | string, opts: NetOpts = {}): any {
+  if (typeof document !== 'undefined') return { ...__NOOP_NET };
+  const isServer = typeof portOrHost === 'number' || opts.onConnection !== undefined
+    || (opts.port !== undefined && opts.host !== undefined && opts.onConnect === undefined);
+  if (isServer) {
+    const port = typeof portOrHost === 'number' ? portOrHost : (opts.port as number);
+    __netReg('tcp', port, opts.host as string | undefined, opts);
+    return { ...__NOOP_NET, address: () => ({ port, host: (opts.host as string) || '0.0.0.0' }) };
+  }
+  const nt = (globalThis as any).__rosefd_net;
+  if (!nt) return { ...__NOOP_NET };
+  const host = typeof portOrHost === 'string' ? portOrHost : (opts.host as string);
+  const sock = nt.createConnection({ host, port: opts.port as number });
+  sock.on('connect', () => (opts.onConnect as (() => void) | undefined)?.());
+  sock.on('data', (d: Buffer) => (opts.onData as (s: unknown, d: Buffer) => void)?.(sock, d));
+  sock.on('close', () => (opts.onClose as (() => void) | undefined)?.());
+  sock.on('error', (e: Error) => (opts.onError as (e: Error) => void)?.(e));
+  __netHandles.push(sock);
+  return sock;
+}
+
+export function $listen(port: number, opts: NetOpts = {}): any {
+  if (typeof document !== 'undefined') return { ...__NOOP_NET, address: () => ({ port, host: (opts.host as string) || 'localhost' }) };
+  const protocol = (opts.protocol as string) || 'http';
+  if (protocol === 'udp') $udp(port, { host: opts.host, onMessage: opts.onData, onError: opts.onError });
+  else if (protocol === 'tcp') $tcp(port, { host: opts.host, onConnection: opts.onConnection, onData: opts.onData });
+  else if (protocol === 'websocket') $websocket(port, { host: opts.host, path: opts.path, onConnection: opts.onConnection });
+  return { close: () => {}, address: () => ({ port, host: (opts.host as string) || '0.0.0.0' }) };
+}
+
+/**
+ * $websocket - WebSocket server (RFC 6455).
+ * Registers a spec like $udp/$tcp; the returned facade delegates to the live
+ * handle once __startNetwork() binds it, so app code can broadcast/close at any
+ * time (on the client the facade is an inert no-op).
+ */
+export function $websocket(port: number, opts: NetOpts = {}): any {
+  const host = opts.host as string | undefined;
+  if (typeof document !== 'undefined') return __NOOP_WS(port, host);
+  __netReg('ws', port, host, opts);
+  return {
+    close: () => __netUnreg('ws', port, host),
+    clients: () => {
+      const h = __netBound.get('ws:' + port + ':' + (host || ''));
+      return h ? (h.clients as () => unknown[])() : [];
+    },
+    broadcast: (data: unknown) => {
+      const h = __netBound.get('ws:' + port + ':' + (host || ''));
+      if (h) (h.broadcast as (d: unknown) => void)(data);
+    },
+    address: () => ({ port, host: host || '0.0.0.0' }),
+  };
+}
+
+/**
+ * $mqtt - MQTT 3.1.1 client (zero-dependency, like $websocket).
+ * Registers a spec; __startNetwork() opens the TCP connection to the broker, so
+ * a build/prerender never dials out. The facade delegates to the live client:
+ * subscribe/publish work before CONNACK (packets queue and flush on connect).
+ */
+export function $mqtt(broker: string, opts: NetOpts = {}): any {
+  const host = (opts.host as string) || __mqttHostOf(broker);
+  const port = (opts.port as number) ?? __mqttPortOf(broker);
+  if (typeof document !== 'undefined') return __NOOP_MQTT;
+  __netReg('mqtt', port, host, opts);
+  const key = 'mqtt:' + port + ':' + host;
+  const bound = () => __netBound.get(key);
+  return {
+    connect: () => {
+      const h = bound();
+      if (h) return (h.connect as () => Promise<void>)();
+      __netBind({ kind: 'mqtt', port, host, opts });
+      const h2 = bound();
+      return h2 ? (h2.connect as () => Promise<void>)() : Promise.reject(new Error('[rosefd] MQTT client unavailable (node:net not injected)'));
+    },
+    disconnect: () => { (bound() as { disconnect?: () => void } | undefined)?.disconnect?.(); },
+    subscribe: (topic: string, sopts: NetOpts = {}) => { (bound() as { subscribe?: (t: string, s: NetOpts) => void } | undefined)?.subscribe?.(topic, sopts); },
+    unsubscribe: (topic: string) => { (bound() as { unsubscribe?: (t: string) => void } | undefined)?.unsubscribe?.(topic); },
+    publish: (topic: string, message: unknown, popts: NetOpts = {}) => { (bound() as { publish?: (t: string, m: unknown, p: NetOpts) => void } | undefined)?.publish?.(topic, message, popts); },
+    get connected() { return (bound() as { connected?: boolean } | undefined)?.connected === true; },
+  };
+}
+
+const __NOOP_MQTT = {
+  connect: (): Promise<void> => Promise.resolve(),
+  disconnect: (): void => {},
+  subscribe: (): void => {},
+  unsubscribe: (): void => {},
+  publish: (): void => {},
+  connected: false,
+};
+
+function __mqttHostOf(broker: string): string {
+  return String(broker).replace(/^\w+:\/\//, '').split(':')[0] || 'localhost';
+}
+function __mqttPortOf(broker: string): number {
+  const m = String(broker).match(/:(\d+)/);
+  return m ? Number(m[1]) : 1883;
+}
+
+// === MQTT 3.1.1 codec (client side) ===
+function __mqttStr(s: string): Buffer {
+  const b = Buffer.from(s, 'utf8');
+  const out = Buffer.allocUnsafe(2 + b.length);
+  out.writeUInt16BE(b.length, 0);
+  b.copy(out, 2);
+  return out;
+}
+function __mqttRemainingLen(len: number): Buffer {
+  const out: number[] = [];
+  do {
+    let b = len % 128;
+    len = Math.floor(len / 128);
+    if (len > 0) b |= 0x80;
+    out.push(b);
+  } while (len > 0);
+  return Buffer.from(out);
+}
+function __mqttPacket(type: number, flags: number, body: Buffer): Buffer {
+  return Buffer.concat([Buffer.from([(type << 4) | flags]), __mqttRemainingLen(body.length), body]);
+}
+/** Incremental packet splitter: complete packets out, partial tail back (same discipline as the WS frame parser). */
+function __mqttParsePackets(buf: Buffer): { packets: { type: number; flags: number; body: Buffer }[]; rest: Buffer } {
+  const packets: { type: number; flags: number; body: Buffer }[] = [];
+  let off = 0;
+  for (;;) {
+    if (off >= buf.length) break;
+    const type = (buf[off] >> 4) & 0x0f;
+    const flags = buf[off] & 0x0f;
+    let mult = 1;
+    let len = 0;
+    let p = off + 1;
+    for (;;) {
+      if (p >= buf.length) return { packets, rest: buf.slice(off) };
+      const b = buf[p++];
+      len += (b & 0x7f) * mult;
+      if ((b & 0x80) === 0) break;
+      mult *= 128;
+    }
+    if (p + len > buf.length) return { packets, rest: buf.slice(off) };
+    packets.push({ type, flags, body: buf.slice(p, p + len) });
+    off = p + len;
+  }
+  return { packets, rest: Buffer.alloc(0) };
+}
+/** Topic filter match: exact segments, '+' one level, '#' the rest (must be last). */
+function __mqttTopicMatch(filter: string, topic: string): boolean {
+  const f = filter.split('/');
+  const t = topic.split('/');
+  for (let i = 0; i < f.length; i++) {
+    if (f[i] === '#') return true;
+    if (i >= t.length) return false;
+    if (f[i] === '+') continue;
+    if (f[i] !== t[i]) return false;
+  }
+  return f.length === t.length;
+}
+
+function __mqttU16(id: number): Buffer {
+  const b = Buffer.allocUnsafe(2);
+  b.writeUInt16BE(id & 0xffff, 0);
+  return b;
+}
+
+/**
+ * Create the live MQTT client for a bound spec. Callbacks are read from
+ * client.opts at event time (same swap-on-re-register discipline as the WS
+ * handle). Packets sent before CONNACK queue and flush on connect.
+ */
+function __mqttConnect(nt: any, port: number, host: string, o: NetOpts): any {
+  const client: any = {
+    opts: o,
+    connected: false,
+    subs: new Map<string, number>(),
+    outbox: [] as Buffer[],
+    nextId: 1,
+    connAck: null as Promise<void> | null,
+    __keepalive: null as ReturnType<typeof setInterval> | null,
+    __sock: null as any,
+    __closed: false,
+    __retry: null as ReturnType<typeof setTimeout> | null,
+    __attempt: 0,
+    __send: (buf: Buffer) => {
+      const s = client.__sock;
+      if (client.connected && s && !s.destroyed) { try { s.write(buf); } catch { /* already gone */ } }
+      else client.outbox.push(buf);
+    },
+    connect: (): Promise<void> => {
+      if (client.connected) return Promise.resolve();
+      if (client.__closed) { client.__closed = false; dial(); return client.connAck; }
+      const s = client.__sock;
+      if (!s || s.destroyed) {
+        if (client.__retry) { clearTimeout(client.__retry); client.__retry = null; }
+        dial();
+      }
+      return client.connAck;
+    },
+    close: () => client.disconnect(),
+    disconnect: () => {
+      client.__closed = true;
+      if (client.__retry) { clearTimeout(client.__retry); client.__retry = null; }
+      try { client.__sock?.write(__mqttPacket(14, 0, Buffer.alloc(0))); } catch { /* already gone */ }
+      try { client.__sock?.end(); } catch { /* already gone */ }
+    },
+    subscribe: (topic: string, sopts: NetOpts = {}) => {
+      client.subs.set(topic, (sopts.qos as number) || 0);
+      client.__send(__mqttPacket(8, 2, Buffer.concat([__mqttU16(client.nextId++), __mqttStr(topic), Buffer.from([(sopts.qos as number) || 0])])));
+    },
+    unsubscribe: (topic: string) => {
+      client.subs.delete(topic);
+      client.__send(__mqttPacket(10, 2, Buffer.concat([__mqttU16(client.nextId++), __mqttStr(topic)])));
+    },
+    publish: (topic: string, message: unknown, popts: NetOpts = {}) => {
+      const qos = (popts.qos as number) || 0;
+      let head = __mqttStr(topic);
+      if (qos > 0) head = Buffer.concat([head, __mqttU16(client.nextId++)]);
+      const payload = typeof message === 'string' ? Buffer.from(message, 'utf8')
+        : Buffer.isBuffer(message) ? message
+        : Buffer.from(String(message), 'utf8');
+      client.__send(__mqttPacket(3, (qos << 1) | (popts.retain ? 1 : 0), Buffer.concat([head, payload])));
+    },
+  };
+
+  const scheduleReconnect = () => {
+    if (client.__closed || client.__retry) return;
+    if (client.opts.reconnect === false) return;
+    const base = (client.opts.reconnectDelay as number) ?? 500;
+    const cap = (client.opts.reconnectMax as number) ?? 30000;
+    const delay = Math.min(base * 2 ** client.__attempt, cap);
+    client.__attempt++;
+    client.__retry = setTimeout(() => { client.__retry = null; dial(); }, delay);
+  };
+
+  const dial = () => {
+    if (client.__closed) return;
+    // One connAck per attempt with isolated resolvers: an awaiter of a dead
+    // attempt sees that attempt's rejection, never a later attempt's.
+    let resolveAck: () => void = () => {};
+    let rejectAck: (e: Error) => void = () => {};
+    client.connAck = new Promise<void>((res, rej) => { resolveAck = res; rejectAck = rej; });
+    // The facade's connect() is optional: an app that ignores it must not turn
+    // a refused broker into an unhandled rejection that kills the process.
+    client.connAck.catch(() => {});
+    const s = nt.createConnection({ host, port });
+    client.__sock = s;
+    (s as any).__mqttBuf = Buffer.alloc(0);
+    s.on('connect', () => {
+      const opts = client.opts; // read dynamically: a per-request render or dev reload swaps opts in place
+      let flags = opts.clean !== false ? 0x02 : 0;
+      const username = opts.username as string | undefined;
+      const password = opts.password as string | undefined;
+      if (username) flags |= 0x80;
+      if (password) flags |= 0x40;
+      const parts: Buffer[] = [__mqttStr('MQTT'), Buffer.from([4]), Buffer.from([flags]), __mqttU16((opts.keepalive as number) ?? 60), __mqttStr((opts.clientId as string) || ('rosefd_' + Math.random().toString(16).slice(2, 10)))];
+      if (username) parts.push(__mqttStr(username));
+      if (password) parts.push(__mqttStr(password));
+      s.write(__mqttPacket(1, 0, Buffer.concat(parts)));
+      if (client.__keepalive) { clearInterval(client.__keepalive); client.__keepalive = null; }
+      const ka = (opts.keepalive as number) ?? 60;
+      if (ka > 0) client.__keepalive = setInterval(() => { try { s.write(__mqttPacket(12, 0, Buffer.alloc(0))); } catch { /* already gone */ } }, Math.max(250, ka * 500));
+    });
+    s.on('data', (chunk: Buffer) => {
+      const buf = (s as any).__mqttBuf as Buffer;
+      (s as any).__mqttBuf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      const { packets, rest } = __mqttParsePackets((s as any).__mqttBuf as Buffer);
+      (s as any).__mqttBuf = rest;
+      for (const pkt of packets) {
+        if (pkt.type === 2) {
+          if (pkt.body.length >= 2 && pkt.body[1] === 0) {
+            client.connected = true;
+            client.__attempt = 0; // a healthy connection resets the backoff
+            for (const q of client.outbox) { try { s.write(q); } catch { /* already gone */ } }
+            client.outbox.length = 0;
+            // clean=true wipes the broker-side session, so every active filter
+            // is re-sent on every (re)connect - the broker cannot restore them.
+            for (const [topic, qos] of client.subs) {
+              try { s.write(__mqttPacket(8, 2, Buffer.concat([__mqttU16(client.nextId++), __mqttStr(topic), Buffer.from([qos])]))); } catch { /* already gone */ }
+            }
+            resolveAck();
+            (client.opts.onConnect as (() => void) | undefined)?.();
+          } else {
+            const err = new Error('[rosefd] MQTT broker refused the connection (code ' + (pkt.body[1] ?? '?') + ')');
+            rejectAck(err);
+            (client.opts.onError as ((e: Error) => void) | undefined)?.(err);
+          }
+        } else if (pkt.type === 3) {
+          if (pkt.body.length < 2) continue;
+          const tlen = pkt.body.readUInt16BE(0);
+          const topic = pkt.body.slice(2, 2 + tlen).toString('utf8');
+          let p = 2 + tlen;
+          const qos = (pkt.flags >> 1) & 0x03;
+          let pid = 0;
+          if (qos > 0 && pkt.body.length >= p + 2) { pid = pkt.body.readUInt16BE(p); p += 2; }
+          const payload = pkt.body.slice(p);
+          for (const filter of client.subs.keys()) {
+            if (__mqttTopicMatch(filter, topic)) { (client.opts.onMessage as ((t: string, m: Buffer) => void) | undefined)?.(topic, payload); break; }
+          }
+          if (qos === 1 && pid) client.__send(__mqttPacket(4, 0, __mqttU16(pid)));
+        }
+        // 9 SUBACK / 11 UNSUBACK / 13 PINGRESP: acknowledgement only, nothing to surface
+      }
+    });
+    s.on('close', () => {
+      if (s !== client.__sock) return; // a stale socket from a previous attempt
+      client.connected = false;
+      if (client.__keepalive) { clearInterval(client.__keepalive); client.__keepalive = null; }
+      if (client.__closed) return; // an app-level disconnect() is final
+      rejectAck(new Error('[rosefd] MQTT connection closed before CONNACK'));
+      scheduleReconnect();
+    });
+    s.on('error', (err: Error) => {
+      if (s !== client.__sock) return;
+      (client.opts.onError as ((e: Error) => void) | undefined)?.(err);
+      if (!client.connected) rejectAck(err);
+    });
+  };
+
+  dial();
+  return client;
 }
 
 export class ActionError extends Error {
@@ -1922,12 +2662,12 @@ export type ActionErrorInfo = { action: string; message: string; code: number; f
  * or let a {#boundary} contain it ($actionErrorOrThrow below).
  */
 export function $actionPending(): boolean {
-  const entry = signalMap.get('actionPending');
+  const entry = renderMaps().signals.get('actionPending');
   return entry ? entry.value === true : false;
 }
 
 export function $actionError(): ActionErrorInfo | null {
-  const e = signalMap.get('actionError');
+  const e = renderMaps().signals.get('actionError');
   if (!e) return null;
   if (currentEffect) {
     e.subs.add(currentEffect);
@@ -1983,7 +2723,7 @@ export function applyStateDeltas(): void {
 
 /** Apply one delta to the live state. */
 export function applyStateDelta(key: string, delta: StateDelta): void {
-  const cur = signalMap.get(key)?.value;
+  const cur = renderMaps().signals.get(key)?.value;
   if (delta.op === 'm') {
     setState(key, { ...(cur as Record<string, unknown> | undefined), ...(delta.value as Record<string, unknown>) });
     return;
