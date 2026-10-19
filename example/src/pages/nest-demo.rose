@@ -1,0 +1,44 @@
+<script>
+  // Nesting stress: {#each} -> {#if} -> {#each} -> {#if}, all driven by one
+  // signal pair. Every level's adopt must tear down exactly its own range -
+  // a stray node or a double-run effect shows up as duplicated rows or a
+  // leftover branch after the flips settle.
+  let groups = $state([
+    { id: 'a', label: 'Group A', on: true, items: ['a1', 'a2'] },
+    { id: 'b', label: 'Group B', on: false, items: ['b1'] },
+  ]);
+  let showOff = $state(true);
+
+  function flipAll() {
+    $setState('groups', (gs: { on: boolean }[]) => gs.map((g) => ({ ...g, on: !g.on })));
+  }
+  function addItem() {
+    $setState('groups', (gs: { items: string[] }[]) => gs.map((g, i) => (i === 0 ? { ...g, items: [...g.items, 'a' + (g.items.length + 1)] } : g)));
+  }
+  function hideOff() { $setState('showOff', !showOff()); }
+</script>
+
+<h1>Nesting</h1>
+<p>
+  <button on:click={flipAll}>Flip all</button>
+  <button on:click={addItem}>Add item</button>
+  <button on:click={hideOff}>Toggle off-groups</button>
+</p>
+
+{#each groups() as g}
+  <section>
+    <h2>{g.label}</h2>
+    {#if g.on}
+      <p class="on">on</p>
+      {#each g.items as it}
+        <span class="item">{it}</span>
+      {/each}
+    {:else}
+      {#if showOff()}
+        <p class="off">off</p>
+      {/if}
+    {/if}
+  </section>
+{/each}
+
+<p><a href="/">Back to the gate</a></p>

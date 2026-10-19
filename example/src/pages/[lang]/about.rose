@@ -23,7 +23,7 @@
   // and a select - each rendered for the locale's own plural categories
   // (Intl.PluralRules), so Arabic's zero/one/two/few/many/other arms all
   // resolve and # formats with the locale's digits.
-  function plural(n) {
+  function plural(n: number) {
     return $t('about.plural', { count: n });
   }
   function ordinal() {
