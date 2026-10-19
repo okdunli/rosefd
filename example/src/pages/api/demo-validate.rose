@@ -1,5 +1,5 @@
 <script>
-  export async function POST(request) {
+  export async function POST(request: Request) {
     const body = await request.json();
     const result = globalThis.__rosefdExtras.v.validate(body, {
       email: ["required", "email"],

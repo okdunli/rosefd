@@ -1,0 +1,80 @@
+<script>
+  // {@const} is a compile-time binding: the name resolves to a value, not a
+  // getter, so it never needs () at the use site. This page pins the
+  // REACTIVITY contract: a const whose expression reads a signal must
+  // re-evaluate when that signal moves - at the top level, inside a block,
+  // and when one const builds on another. The Shadowing section pins the
+  // SCOPING contract: a const may shadow a state of the same name (the
+  // initializer still reads the signal, uses after it read the const), a
+  // nested const of the same name builds on the outer one, and the state is
+  // back in scope after the block closes. The same contract holds for the
+  // bindings a block INTRODUCES: an {#each} item shadows every outer name
+  // inside its body (here it shadows both the const and the state), and the
+  // outer names are back after {/each}. The In handlers section pins the
+  // third scope: a top-level const is hoisted into the render() scope, so an
+  // on:click expression can read it (and reads the live value, not a
+  // snapshot).
+  let price = $state(10);
+  let qty = $state(2);
+  let show = $state(true);
+  let stamped = $state('none');
+  let rows = $state([{ n: 'a', p: 3 }, { n: 'b', p: 5 }]);
+  function bump() { $setState('qty', qty() + 1); }
+  function toggle() { $setState('show', !show()); }
+</script>
+
+<h1>Const reactivity</h1>
+
+{@const total = price() * qty()}
+{@const label = 'total: ' + total}
+
+<p>direct: {price() * qty()}</p>
+<p>const: {total}</p>
+<p data-total={total}>attr: {total}</p>
+<p>{label}</p>
+
+{#if total > 100}
+  <p class="big">big total</p>
+{:else}
+  <p class="small">small total</p>
+{/if}
+
+{#if show}
+  {@const badge = 'qty ' + qty()}
+  <p class="badge">{badge}</p>
+{/if}
+
+<h2>Per item</h2>
+<ul>
+{#each rows() as row}
+  {@const line = row.n + '=' + row.p * qty()}
+  <li>{line}</li>
+{/each}
+</ul>
+
+<h2>Shadowing</h2>
+{@const qty = qty() * 1000}
+<p>shadow: {qty}</p>
+{#if show}
+  {@const qty = qty * 10}
+  <p>shadow in block: {qty}</p>
+{/if}
+<p>signal after block: {qty()}</p>
+<ul class="each-shadow">
+{#each rows() as qty}
+  {@const line = qty.n + ' x' + qty.p}
+  <li>{line}</li>
+{/each}
+</ul>
+<p>signal after each: {qty()}</p>
+
+<p>
+  <button on:click={bump}>Bump qty</button>
+  <button on:click={toggle}>Toggle</button>
+</p>
+
+<h2>In handlers</h2>
+<p>stamped: {stamped()}</p>
+<button class="stamp" on:click={() => $setState('stamped', total)}>Stamp total</button>
+
+<p><a href="/">Back to the gate</a></p>
