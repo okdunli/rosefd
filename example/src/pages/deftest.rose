@@ -1,17 +1,19 @@
 <script>
-  export const bundle = 'split';
   let n = $state(2);
-  let sq = $derived(n * n);
+  let sq = $derived(n() * n());
   function bump() { $setState('n', n() + 1); }
   let m = $state(10);
   // F36: functional update - the setter receives the current value.
-  function fnBump() { $setState('m', (x) => x + 5); }
+  function fnBump() { $setState('m', (x: number) => x + 5); }
   let numv = $state(5);
   // F43: $effect - mirrors n*7 into state; the returned cleanup counts disposals.
   let mirror = $state(0);
+  // F43: $effect - mirrors n*7 into state; the returned cleanup counts
+  // disposals on a GLOBAL so the client smoke test can observe them across
+  // navigations (a local counter dies with the route's module scope).
   $effect(() => {
     $setState('mirror', n() * 7);
-    return () => { globalThis.__effCleanup = (globalThis.__effCleanup || 0) + 1; };
+    return () => { (globalThis as any).__effCleanup = ((globalThis as any).__effCleanup || 0) + 1; };
   });
   let keyedItems = $state([{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }, { id: 'c', label: 'C' }]);
   function shuffle() {
@@ -21,7 +23,7 @@
   let selm = $state([]);
   let dopen = $state(true);
   globalThis.__rosefdTransitions = globalThis.__rosefdTransitions || {};
-  globalThis.__rosefdTransitions.pulse = function (el, d) {
+  globalThis.__rosefdTransitions.pulse = function (el: HTMLElement, d: number) {
     el.style.opacity = '0.4';
     const id = setTimeout(function () { el.style.opacity = ''; }, d);
     return function () { clearTimeout(id); };
