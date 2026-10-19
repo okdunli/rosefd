@@ -1,0 +1,14 @@
+{
+  "name": "rosefd-mqtt-subscriber",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rosefd dev",
+    "build": "rosefd build",
+    "preview": "rosefd preview",
+    "serve": "rosefd serve"
+  },
+  "dependencies": {
+    "rosefd": "latest"
+  }
+}
