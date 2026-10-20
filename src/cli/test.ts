@@ -84,7 +84,7 @@ export interface TestApp {
   /** render a route with a POST body: runs the server action, re-renders */
   post(fields?: Record<string, unknown>, req?: TestRequest & { route?: string }): Promise<TestResult>;
   /** call an api route: the parsed JSON body (or the raw Response) */
-  api(method: string, pathname: string, req?: TestRequest): Promise<{ status: number; body: unknown; headers: Record<string, string> }>;
+  api(method: string, pathname: string, req?: TestRequest): Promise<{ status: number; body: unknown; headers: Record<string, string | string[]> }>;
   /** mount the route in a DOM and drive it like a user would */
   mount(req?: TestRequest): Promise<TestHandle>;
 }
@@ -417,8 +417,12 @@ export async function test(file: string, opts: TestOptions = {}): Promise<TestAp
         body = JSON.parse(text);
       } catch {  }
       
-      const headers: Record<string, string> = {};
-      res.headers.forEach((v: string, k: string) => { headers[k] = v; });
+      // set-cookie is a list header: forEach delivers it per value, so a plain
+      // object assignment keeps only the last one. Keep the whole array.
+      const headers: Record<string, string | string[]> = {};
+      const cookies = res.headers.getSetCookie?.() ?? [];
+      res.headers.forEach((v: string, k: string) => { if (cookies.length && k.toLowerCase() === 'set-cookie') return; headers[k] = v; });
+      if (cookies.length) headers['set-cookie'] = cookies;
       return { status: res.status, body, headers };
     },
     mount,
