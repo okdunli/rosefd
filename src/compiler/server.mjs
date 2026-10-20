@@ -1175,11 +1175,11 @@ ${hoisted.rest}`, "ssr").trim()}`,
   }
   const bundleMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+bundle\s*=\s*['"`](\w+)['"`]\s*;?/);
   const bundle = bundleMatch ? bundleMatch[1] : void 0;
-  if (bundle && !["inline", "split"].includes(bundle)) {
+  if (bundle && !["inline", "split", "sliced"].includes(bundle)) {
     throw new RoseError(
       "E-EXPORT",
-      `${filePath2}: export const bundle must be 'inline' or 'split'`,
-      { file: filePath2, line: lineAt(rawScript, bundleMatch), hint: "'inline' (default) is the single-document mode; 'split' is mode B for large apps - route-level chunks, loaded on demand" }
+      `${filePath2}: export const bundle must be 'inline', 'split' or 'sliced'`,
+      { file: filePath2, line: lineAt(rawScript, bundleMatch), hint: "'inline' (default) is the single-document mode; 'split' is mode B for large apps - route-level chunks, loaded on demand; 'sliced' inlines the runtime plus each route's own render chain and shares the rest via a nav chunk" }
     );
   }
   const csrMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+csr\s*=\s*(true|false)\s*;?/);
@@ -2721,8 +2721,8 @@ function assertKnownDirectives(template, filePath2) {
     }
     throw new RoseError(
       "E-TEMPLATE",
-      `${filePath2}: {:${word}} is not a rosefd directive`,
-      { file: filePath2, line: lineAt(template, m), hint: "rosefd templates support {#if}/{:else}, {#each} and {#boundary}" }
+      `${filePath2}: {:${word}} is not a Rose Frame Driver directive`,
+      { file: filePath2, line: lineAt(template, m), hint: "Rose Frame Driver templates support {#if}/{:else}, {#each} and {#boundary}" }
     );
   }
   const OPENER_RE = /\{#(if|each|boundary|island|await)\b([^}]*)\}/g;
@@ -4458,7 +4458,7 @@ export async function renderPage(pathname, form) {
 
 async function renderPageIsolated(pathname, form) {
   clearRequestState();
-  // Cold-start readiness gate (oboext #8): await the app's published DB-ready promise before any $data() read.
+  // Cold-start readiness gate (Eoboext #8): await the app's published DB-ready promise before any $data() read.
   const appReady = globalThis.__rosefdAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;
@@ -4631,7 +4631,7 @@ export async function renderPageStream(pathname, write, shellOpen, clientTag) {
 
 async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
   clearRequestState();
-  // Cold-start readiness gate (oboext #8): same contract as renderPage \u2014 await the app's published DB-ready promise before streaming the shell.
+  // Cold-start readiness gate (Eoboext #8): same contract as renderPage \u2014 await the app's published DB-ready promise before streaming the shell.
   const appReady = globalThis.__rosefdAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;

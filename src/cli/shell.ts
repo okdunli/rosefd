@@ -8,26 +8,59 @@ import { fnv1a32 } from '../hash.js';
 
 const OUT_DIR = path.join(process.cwd(), 'dist');
 
-let clientCache: { mtimeMs: number; source: string } | null = null;
+let clientCache: { for: string; mtimeMs: number; source: string } | null = null;
+// Sliced mode caches one entry per slice file (a route's inline bundle), each
+// keyed by its own mtime: a dev rebuild that only touched one route rewrites
+// one slice, and the other routes' documents keep their cached source.
+const sliceCaches = new Map<string, { mtimeMs: number; source: string }>();
 
 
 let splitMode = false;
+let slicedMode = false;
 export function setBundleMode(mode: string): void {
   splitMode = mode === 'split';
+  slicedMode = mode === 'sliced';
 }
 
-/** Read dist/client.js with an mtime-based cache (dev server rebuilds it). */
-export function getClientSource(): string | null {
+/**
+ * The inline bundle source for a document.
+ *
+ * - inline mode: dist/client.js (every route's code, inlined into every
+ *   interactive document).
+ * - split mode: null - the runtime is an external module fetch.
+ * - sliced mode: dist/slices/<key>.js when the server named a key (the route's
+ *   own runtime + render chain), dist/client.js otherwise (the runtime-only
+ *   core: mount.js embedders and 404/500 documents, which have no route of their
+ *   own to slice).
+ *
+ * `dir` defaults to this process's OUT_DIR (the CLI's project dist). The edge
+ * adapter serves a dist it was handed at creation, which is NOT the process
+ * cwd's dist - a slice resolved against the wrong directory would silently
+ * fall back to the core and ship every route's render chain in one document.
+ */
+export function getClientSource(routeKey?: string | null, dir: string = OUT_DIR): string | null {
   if (splitMode) return null;
-  
-  const file = path.join(OUT_DIR, 'client.js');
+  const file = slicedMode && routeKey
+    ? path.join(dir, 'slices', `${routeKey}.js`)
+    : path.join(dir, 'client.js');
   try {
     const st = fs.statSync(file);
-    if (!clientCache || clientCache.mtimeMs !== st.mtimeMs) {
-      clientCache = { mtimeMs: st.mtimeMs, source: fs.readFileSync(file, 'utf-8') };
+    if (slicedMode && routeKey) {
+      const hit = sliceCaches.get(routeKey + '\0' + dir);
+      if (hit && hit.mtimeMs === st.mtimeMs) return hit.source;
+      const source = fs.readFileSync(file, 'utf-8');
+      sliceCaches.set(routeKey + '\0' + dir, { mtimeMs: st.mtimeMs, source });
+      return source;
+    }
+    if (!clientCache || clientCache.for !== dir || clientCache.mtimeMs !== st.mtimeMs) {
+      clientCache = { for: dir, mtimeMs: st.mtimeMs, source: fs.readFileSync(file, 'utf-8') };
     }
     return clientCache.source;
   } catch {
+    // A slice file that vanished (a route removed between the build and the
+    // serve) falls back to the core: the document still boots, every route
+    // riding the nav chunk.
+    if (slicedMode && routeKey) return getClientSource(null, dir);
     return null;
   }
 }
@@ -311,8 +344,8 @@ export function mintNonce(): string {
  * The document's CSP. Two shapes, chosen per response:
  *
  * - no nonce (the default): `script-src 'sha256-…'` over the exact bytes the
- *   tag will carry. Nothing else may run - the strongest policy rosefd has,
- *   and the reason a rosefd document needs no 'unsafe-inline'.
+ *   tag will carry. Nothing else may run - the strongest policy Rose Frame Driver has,
+ *   and the reason a Rose Frame Driver document needs no 'unsafe-inline'.
  * - a nonce (a route exporting `csp = { nonce: true }`):
  *   `script-src 'nonce-…' 'strict-dynamic'`. A hash dies the moment anything
  *   between the server and the browser touches the document - a CDN, a WAF,
@@ -330,8 +363,12 @@ export function securityHeaders(client: string | null, nonce = ''): Record<strin
     return headers;
   }
   if (!cspCache || cspCache.for !== client || cspCache.v !== (client ? '' : getClientVersion())) {
+    // Sliced mode: the document's own bytes are hash-locked as usual, and
+    // 'self' is added because the first cross-route navigation dynamically
+    // imports /nav.js - a same-origin module fetch the hash alone would block.
+    // (Split mode has the same shape: its external runtime needs 'self'.)
     const scriptSrc = client
-      ? `'sha256-${createHash('sha256').update(inlineScript(client), 'utf-8').digest('base64')}'`
+      ? `'sha256-${createHash('sha256').update(inlineScript(client), 'utf-8').digest('base64')}'${slicedMode ? " 'self'" : ''}`
       : `'self' 'sha256-${createHash('sha256').update(externalBootstrap(), 'utf-8').digest('base64')}'`;
     cspCache = {
       for: client,
@@ -373,13 +410,22 @@ const STYLES_MIN = STYLES.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"']+/g,
  * fallback were dropped here in silence - the compiler collected them, the
  * merge threw them away, and a CMS theme system had no way to ship its
  * per-request CSS. Every head element now passes through: the keyed
- * singletons keep their name/property/rel/charset identity, and everything
+ * singletons keep their name/property identity, and everything
  * else is keyed by id when it has one and by tag+position when it does not,
  * so two layouts' <style> blocks coexist and a page still overrides its
  * layout's. Passthrough elements carry HEAD_ATTR too (the attribute the
  * runtime manages) so a client-side navigation replaces or drops them like
  * any other managed element instead of leaking the previous route's CSS
  * into every route visited after it.
+ *
+ * Bug report 2026-10-13 (Eoboext): a `<link>` keyed by its bare `rel` meant the
+ * SECOND link of any same-rel group was silently dropped - hreflang alternates,
+ * multi-size icons, font preloads, several feeds all lost every member but the
+ * first. A rel-only key now carries the link's target (`href`, or `type`/`as`
+ * when it has no href), so same-rel links coexist. `rel="canonical"` is the
+ * one documented singleton and keeps the bare-rel key, so a page's canonical
+ * still overrides its layout's. The client's applyHead derives keys the same
+ * way, so the two halves keep agreeing without talking to each other.
  */
 function mergeHeadBlocks(blocks: string[]): string {
   const byKey = new Map<string, string>();
@@ -397,20 +443,44 @@ function mergeHeadBlocks(blocks: string[]): string {
       const tag = m[1].toLowerCase();
       if (tag === 'title') continue;
       const attrs = m[2];
-      const keyMatch = attrs.match(/\s(?:name|property|rel|charset)=(?:"([^"]*)"|'([^']*)')/i);
+      const attr = (name: string): string | null => {
+        const mm = attrs.match(new RegExp(`\\s${name}=(?:"([^"]*)"|'([^']*)')`, 'i'));
+        return mm ? (mm[1] ?? mm[2]) : null;
+      };
       const idMatch = attrs.match(/\sid=(?:"([^"]*)"|'([^']*)')/i);
+      const name = attr('name');
+      const property = attr('property');
+      const rel = attr('rel');
+      const charset = attr('charset');
       let key: string;
-      if (keyMatch) key = `${tag}:${keyMatch[1] ?? keyMatch[2]}`;
+      if (name !== null) key = `${tag}:${name}`;
+      else if (property !== null) key = `${tag}:${property}`;
+      else if (rel !== null) key = `${tag}:${rel}${linkIdentitySuffix(rel, attr)}`;
+      else if (charset !== null) key = `${tag}:${charset}`;
       else if (idMatch) key = `${tag}:${idMatch[1] ?? idMatch[2]}`;
       else {
         key = `${tag}:#${positional.get(tag) ?? 0}`;
         positional.set(tag, (positional.get(tag) ?? 0) + 1);
       }
+      // The key is stamped into a double-quoted attribute value, so a quote
+      // inside a (pathological) href must not break the markup.
+      key = key.replace(/"/g, '');
       const marked = m[0].replace(/^<\w+/, (t) => `${t} data-rosefd-head="${key}"`);
       put(key, marked);
     }
   }
   return order.map((k) => byKey.get(k)!).join('\n  ');
+}
+
+/**
+ * The suffix that joins a rel-only link's identity key. `canonical` is a
+ * spec singleton - the first one wins so a page overrides its layout's. Every
+ * other rel may legitimately repeat with a different target, so the target
+ * (`href`, falling back to `type`/`as`) becomes part of the key.
+ */
+function linkIdentitySuffix(rel: string, attr: (name: string) => string | null): string {
+  if (/(^|\s)canonical(\s|$)/i.test(rel)) return '';
+  return `@${attr('href') ?? attr('type') ?? attr('as') ?? ''}`;
 }
 
 /**
@@ -506,6 +576,8 @@ export function buildShell(ssrHtml: string, stateJson: string, client: string | 
 }
 
 /** Node entry: reads dist/client.js from disk (mtime-cached). */
-export function getHtmlShell(ssrHtml: string, stateJson: string, head: string[] = [], js = true, lang = 'en', dir = '', nonce = '', shell = true): string {
-  return buildShell(ssrHtml, stateJson, getClientSource(), head, getStyles(), js, lang, dir, nonce, shell);
+export function getHtmlShell(ssrHtml: string, stateJson: string, head: string[] = [], js = true, lang = 'en', dir = '', nonce = '', shell = true, routeKey: string | null = null): string {
+  // Sliced mode: routeKey names the route's own inline bundle (the server's
+  // sliceKeyFor); null keeps the runtime-only core.
+  return buildShell(ssrHtml, stateJson, getClientSource(routeKey), head, getStyles(), js, lang, dir, nonce, shell);
 }
