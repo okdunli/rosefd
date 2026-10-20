@@ -1,6 +1,6 @@
 {
   "name": "rosefd",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "The next-century web framework: zero-hydration, compile-time reactivity, single binary deploy",
   "type": "module",
   "scripts": {
@@ -16,6 +16,7 @@
     "test:e2e": "tsx tests/test-e2e.ts",
     "test:edge": "tsx tests/test-edge.ts",
     "test:harness": "tsx tests/test-harness.ts",
+    "test:sliced": "tsx tests/test-sliced.ts",
     "test:go": "tsx src/cli/index.ts build example && node tests/test-go.mjs",
     "test:pack": "node tests/test-pack.mjs",
     "build:go": "go build -o rosefd-server ."
