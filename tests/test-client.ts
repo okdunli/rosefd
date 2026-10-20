@@ -8,8 +8,11 @@
  */
 
 import { JSDOM } from 'jsdom';
-import { readFileSync, readdirSync, existsSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, mkdtempSync, mkdirSync, cpSync, rmSync } from 'fs';
 import { createHash } from 'crypto';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { pathToFileURL } from 'url';
 import { renderPage, renderPageStream, canStream, shellOff, handleApi, isApi, apiPrerender, localeList, defaultLocale } from '../dist/server.js';
 import { buildShell, getHtmlShell, shellOpen, securityHeaders } from '../src/cli/shell.js';
 
@@ -39,6 +42,10 @@ let lastPostState: any = null;
 };
 
 const { start, startNotFound, adopt, $action, ensureLocale, loadLocale } = await import('../dist/client.js');
+// applyHead is not on the client entry's export list (the runtime's wire() calls
+// it internally on navigation) - the same source the bundle is built from, so
+// the client half of the head-identity contract is still the real thing.
+const { applyHead } = await import('../src/runtime/index.js');
 
 const document = dom.window.document;
 const appEl = document.getElementById('app')!;
@@ -252,8 +259,54 @@ const managedKeys = () => Array.from(document.head.querySelectorAll('[data-rosef
   .join(',');
 // /about carries TWO managed styles on purpose: the <head> block's .rfetch and
 // the component's own scoped .rcard - a fresh SSR load of the route has both,
-// so the round trip must land on exactly this set (no duplicate, no leak).
-assert(managedKeys() === 'meta:description,meta:generator,style:#0,style:rosefd-style-about', 'the about head set survives a round trip exactly (no dupes, no leaks)', managedKeys());
+// so the round trip must land on exactly this set (no duplicate, no leak). It
+// also carries TWO same-rel feed links (bug report 2026-10-13) - a rel-only
+// identity key used to drop the second one in silence.
+assert(managedKeys() === 'link:alternate@/api/feed.xml,link:alternate@/en/api/feed.xml,meta:description,meta:generator,style:#0,style:rosefd-style-about', 'the about head set survives a round trip exactly (no dupes, no leaks)', managedKeys());
+
+// --- same-rel <link> groups: the second member used to be dropped in silence ---
+const twoFeeds = buildShell('<p>hi</p>', '{}', null, [
+  '<link rel="alternate" type="application/rss+xml" href="/api/feed.xml" title="Rose Frame Driver feed">',
+  '<link rel="alternate" type="application/rss+xml" href="/en/api/feed.xml" title="Rose Frame Driver feed (English)">',
+]);
+assert((twoFeeds.match(/rel="alternate"/g) || []).length === 2, 'two same-rel links with different hrefs both reach the document (server merge)');
+assert(twoFeeds.includes('data-rosefd-head="link:alternate@/api/feed.xml"'), 'the first feed keeps an href-qualified key');
+assert(twoFeeds.includes('data-rosefd-head="link:alternate@/en/api/feed.xml"'), 'the second feed keeps its own href-qualified key');
+const hreflangTriple = buildShell('<p>hi</p>', '{}', null, [
+  '<link rel="alternate" hreflang="en" href="https://rosefd.dev/en/about">',
+  '<link rel="alternate" hreflang="zh" href="https://rosefd.dev/zh/about">',
+  '<link rel="alternate" hreflang="x-default" href="https://rosefd.dev/about">',
+]);
+assert((hreflangTriple.match(/rel="alternate"/g) || []).length === 3, 'an hreflang triple survives without distinct name= attributes');
+const twoPreloads = buildShell('<p>hi</p>', '{}', null, [
+  '<link rel="preload" as="font" type="font/woff2" href="/fonts/a.woff2" crossorigin>',
+  '<link rel="preload" as="font" type="font/woff2" href="/fonts/b.woff2" crossorigin>',
+]);
+assert((twoPreloads.match(/rel="preload"/g) || []).length === 2, 'multiple font preloads coexist');
+const sameFeed = buildShell('<p>hi</p>', '{}', null, [
+  '<link rel="alternate" type="application/rss+xml" href="/api/feed.xml">',
+  '<link rel="alternate" type="application/rss+xml" href="/api/feed.xml">',
+]);
+assert((sameFeed.match(/rel="alternate"/g) || []).length === 1, 'a same-rel link with the SAME href is still deduped (first wins)');
+const canonicalOverride = buildShell('<p>hi</p>', '{}', null, [
+  '<link rel="canonical" href="https://rosefd.dev/about">',
+  '<link rel="canonical" href="https://rosefd.dev/">',
+]);
+assert((canonicalOverride.match(/rel="canonical"/g) || []).length === 1, 'canonical stays a singleton: the page link overrides the layout link');
+assert(canonicalOverride.includes('href="https://rosefd.dev/about"') && !canonicalOverride.includes('href="https://rosefd.dev/"'), 'the surviving canonical is the first one (the page\'s)');
+const keyedMetaStillWins = buildShell('<p>hi</p>', '{}', null, ['<meta name="description" content="page">', '<meta name="description" content="layout">']);
+assert((keyedMetaStillWins.match(/name="description"/g) || []).length === 1 && keyedMetaStillWins.includes('content="page"'), 'a keyed meta still dedupes page-over-layout (the old contract holds)');
+
+// Client half: applyHead derives the same keys from the merged fragment.
+applyHead('<link rel="alternate" type="application/rss+xml" href="/api/feed.xml"><link rel="alternate" type="application/rss+xml" href="/en/api/feed.xml"><link rel="canonical" href="https://rosefd.dev/x"><link rel="canonical" href="https://rosefd.dev/">');
+const liveFeeds = () => Array.from(document.head.querySelectorAll('link[rel="alternate"]')).map((el) => el.getAttribute('href'));
+assert(liveFeeds().join(',') === '/api/feed.xml,/en/api/feed.xml', 'applyHead keeps both same-rel links (client merge)');
+assert(document.head.querySelector('link[data-rosefd-head="link:alternate@/api/feed.xml"]') !== null, 'the client stamps the href-qualified key');
+assert(document.head.querySelectorAll('link[rel="canonical"]').length === 1, 'applyHead keeps canonical a singleton');
+assert(document.head.querySelector('link[rel="canonical"]')!.getAttribute('href') === 'https://rosefd.dev/x', 'the first canonical wins on the client too');
+applyHead('<title>bare</title>');
+assert(liveFeeds().length === 0, 'a route without feeds drops them (no leak into later routes)');
+assert(document.head.querySelectorAll('link[rel="canonical"]').length === 0, 'a route without a canonical drops it');
 
 (globalThis as any).location = { pathname: '/guarded' };
 await start(appEl, '/guarded', false);
@@ -273,6 +326,8 @@ assert(/<title>About Rose Frame Driver - Rose Frame Driver<\/title>/.test(aboutD
 assert(/<meta [^>]*name="description"[^>]*content="What Rose Frame Driver is/.test(aboutDoc), 'prerendered about page has its description meta');
 if (false) assert(/<meta [^>]*name="generator" content="Rose Frame Driver">/.test(aboutDoc), 'prerendered about page T15: layout meta');
 assert(/<style data-rosefd-head="style:#0">\.rfetch/.test(aboutDoc), 'the prerendered document carries the route head <style> (bug report 11:46)');
+assert((aboutDoc.match(/data-rosefd-head="link:alternate@/g) || []).length === 2, 'the prerendered about document carries both same-rel feed links (bug report 2026-10-13)');
+assert(aboutDoc.includes('data-rosefd-head="link:alternate@/api/feed.xml"'), 'the prerendered feed link carries its href-qualified key');
 assert(aboutDoc.includes('<p class="rfetch">data fetches:'), 'the styled element is served with its class');
 const bodyOf = (doc: string) => doc.replace(/<script[\s\S]*?<\/script>/g, '').slice(doc.indexOf('<body>'));
 assert(!/<title|<meta/i.test(bodyOf(aboutDoc)), 'no head content leaks into the prerendered body');
@@ -949,7 +1004,7 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   try {
     await probe('<script>\nexport const bundle = "huge";\n</script>\n<p>hi</p>');
   } catch (err) { badBundle = (err as Error).message; }
-  assert(badBundle.includes("must be 'inline' or 'split'"), `an invalid bundle mode fails the build naming the two modes (got: ${badBundle})`);
+  assert(badBundle.includes("must be 'inline', 'split' or 'sliced'"), `an invalid bundle mode fails the build naming the three modes (got: ${badBundle})`);
 
   assert((await probe('<script>\nexport const csp = { nonce: true };\n</script>\n<p>hi</p>')).cspNonce === true, 'a component exporting csp = { nonce: true } records the nonce mode');
   assert((await probe('<script>\nexport const csp = { nonce: false };\n</script>\n<p>hi</p>')).cspNonce === false, 'csp = { nonce: false } records the hashed default');
@@ -1518,6 +1573,96 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   await start(appEl, '/deftest', false);
   await tick();
   assert((appEl.querySelector('.eff-mirror') as HTMLElement)?.textContent === '14', 'F43: a fresh $effect registers on route re-entry (2*7=14)');
+}
+
+// --- R51: two separately-bundled runtime copies must share one state ---
+// This is the property route-scoped inlining rests on: every per-page bundle
+// carries its own copy of the runtime, and the tables those copies index (the
+// one document, the one signal-key space, the one store namespace) are shared.
+// Two copies that each keep their own tables double-bind handlers, lose each
+// other's signals and re-run each other's loaders - the failure that sank the
+// first attempt at route slicing. The two copies here are real, separately
+// imported module instances (the bundle case is the same shape at larger scale).
+{
+  const scratch = mkdtempSync(join(tmpdir(), 'rosefd-r51-dual-'));
+  try {
+    for (const name of ['a', 'b']) {
+      mkdirSync(join(scratch, name), { recursive: true });
+      cpSync('src/runtime/index.ts', join(scratch, name, 'index.ts'));
+      cpSync('src/runtime/lorawan.ts', join(scratch, name, 'lorawan.ts'));
+    }
+    const modA = await import(pathToFileURL(join(scratch, 'a', 'index.ts')).href);
+    const modB = await import(pathToFileURL(join(scratch, 'b', 'index.ts')).href);
+
+    const [, setA] = modA.state('r51dual', 1);
+    setA(2);
+    const [getB] = modB.state('r51dual', 9);
+    assert(getB() === 2, 'two runtime copies share one signal map (a write in one is a read in the other)');
+
+    modA.markSeeded('r51seed');
+    assert(modB.isSeeded('r51seed'), 'two runtime copies share the seeded-key set');
+
+    modB.setLocales({ xx: { hello: 'HI' } }, 'xx');
+    assert(modA.localeList().includes('xx'), 'two runtime copies share the locale catalog (a merged install, not a replacing one)');
+    assert(modA.isLocale('xx'), 'the shared catalog answers isLocale across copies');
+
+    const sa = modA.$store('r51store', 1);
+    sa.set(5);
+    assert(modB.$store('r51store', 1).get() === 5, 'two runtime copies share the $store table');
+
+    let bCalls = 0;
+    await modA.loader('r51loader', async () => 'A');
+    const pb = modB.loader('r51loader', async () => { bCalls++; return 'B'; });
+    assert(await pb === 'A' && bCalls === 0, 'two runtime copies share the loader cache (the second copy\'s thunk never runs)');
+
+    let cleaned = 0;
+    modA.onCleanup(() => { cleaned++; });
+    modB.resetEffects();
+    assert(cleaned === 1, 'two runtime copies share the cleanup set (one copy disposes the other\'s)');
+
+    let mounted = 0;
+    modA.onMount(() => { mounted++; });
+    modB.flushMounts();
+    assert(mounted === 1, 'two runtime copies share the mount queue');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// --- R52: without an async-local store, overlapping renders must serialise ---
+// isolateRender's fallback path (edge, client - no AsyncLocalStorage) swaps the
+// FIELDS of the one shared render-maps object, which is only sound while one
+// render runs at a time. Two overlapping renders used to interleave their
+// swaps: the second overwrote the first's fresh tables and the first's finally
+// restored the process-wide pair out from under the second, so a render
+// resumed from its await read the OTHER render's signal table. The fallback
+// path now takes a shared render mutex first - this process has no context
+// store installed, so it exercises exactly that path.
+{
+  const { isolateRender, state, hasState } = await import('../src/runtime/index.js');
+  const order: string[] = [];
+  let aSawOwnSignal = false;
+  let bSawAsSignal = false;
+  const pA = isolateRender(async () => {
+    order.push('A-start');
+    state('r52akey', 1);
+    await tick();
+    order.push('A-resume');
+    aSawOwnSignal = hasState('r52akey');
+    order.push('A-end');
+  });
+  const pB = isolateRender(async () => {
+    order.push('B-start');
+    await tick();
+    order.push('B-resume');
+    bSawAsSignal = hasState('r52akey');
+    order.push('B-end');
+  });
+  await Promise.all([pA, pB]);
+  assert(order.join(',') === 'A-start,A-resume,A-end,B-start,B-resume,B-end',
+    'without a context store, overlapping renders serialise (the shared mutex orders them)', order.join(','));
+  assert(aSawOwnSignal, 'a render still sees its own signal after its await (the other render cannot swap the table out from under it)');
+  assert(!bSawAsSignal, 'a render cannot see the previous render\'s isolated signals');
 }
 
 console.log(`\nAll client pipeline checks passed - ${checks} assertions.`);

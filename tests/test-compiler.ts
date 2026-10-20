@@ -1519,6 +1519,84 @@ if (failures) {
   safeRm(tmpP);
 }
 
+// F32: the construct loop must scale LINEARLY in the construct count. It used
+// to re-scan the whole remaining template for every construct (5 findBlock
+// searches + the expression, component, raw-tag and comment look-aheads, all
+// over a shrinking copy), so a template with N constructs cost O(N x template)
+// - 52ms for 1600 {#if} blocks, and the gap widened with size. The loop now
+// keeps the template whole, walks a cursor, and caches each look-ahead until
+// the cursor passes it. The check is a same-machine RATIO: 8x the constructs
+// costs ~6x when linear and ~20x when quadratic, so the 11x line is decisive
+// without depending on machine speed.
+{
+  const fsR = await import('fs');
+  const pathR = await import('path');
+  fsR.mkdirSync('.test-compiler-out', { recursive: true });
+  const tmpR = pathR.resolve('.test-compiler-out', 'many-blocks.rose');
+  const blocks = (n: number): string => {
+    let body = '';
+    for (let i = 0; i < n; i++) body += `{#if s}\n  <b>b${i}</b>\n{/if}\n`;
+    return `<script>\n  let s = $state(1);\n</script>\n${body}`;
+  };
+  const timeCompile = async (src: string): Promise<number> => {
+    fsR.writeFileSync(tmpR, src, 'utf-8');
+    await compileComponent(tmpR, pathR.join(process.cwd(), 'public'), 'manyblockspage', false, [], new Map());
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t0 = performance.now();
+      await compileComponent(tmpR, pathR.join(process.cwd(), 'public'), 'manyblockspage', false, [], new Map());
+      best = Math.min(best, performance.now() - t0);
+    }
+    return best;
+  };
+  const small = await timeCompile(blocks(400));
+  const big = await timeCompile(blocks(3200));
+  check('F32 construct loop: 8x the construct count does not cost 8x the time', big / small < 11, `${small.toFixed(1)}ms for 400 blocks, ${big.toFixed(1)}ms for 3200 (ratio ${(big / small).toFixed(1)}, linear ~8, quadratic ~20)`);
+  check('F32 construct loop: a 3200-block template compiles without a blowup', big < 400, `${big.toFixed(1)}ms`);
+  safeRm(tmpR);
+}
+
+// F33: the two error paths that name the file - a keyed {#each} over a
+// destructuring pattern, and {@render} before its {#snippet} - interpolated a
+// `filePath` that compileTemplate never had in scope, so instead of the
+// intended diagnostic the build died with `ReferenceError: filePath is not
+// defined` (the hint, and the file it points at, were lost). compileComponent
+// now publishes the file it is compiling.
+{
+  const fsQ = await import('fs');
+  const pathQ = await import('path');
+  fsQ.mkdirSync('.test-compiler-out', { recursive: true });
+  const tmpQ = pathQ.resolve('.test-compiler-out', 'keyed-destructure.rose');
+  fsQ.writeFileSync(tmpQ, `<script>
+  let rows = $state([{ id: 1 }]);
+</script>
+{#each rows() as { id } (id)}
+  <p>{id}</p>
+{/each}`, 'utf-8');
+  let msgQ = '';
+  try {
+    await compileComponent(tmpQ, pathQ.join(process.cwd(), 'public'), 'keyeddpage', false, [], new Map());
+  } catch (e) { msgQ = String((e as Error).message); }
+  check('F33 keyed destructure: the diagnostic names the rule, not a ReferenceError', msgQ.includes('keys on a named item') && !msgQ.includes('filePath is not defined'), msgQ.slice(0, 120));
+  check('F33 keyed destructure: the message points at the file', msgQ.includes('keyed-destructure.rose'));
+  safeRm(tmpQ);
+
+  const tmpQ2 = pathQ.resolve('.test-compiler-out', 'render-before-snippet.rose');
+  fsQ.writeFileSync(tmpQ2, `<script>
+  let name = $state('x');
+</script>
+{@render zCardQ(name)}
+{#snippet zCardQ(who)}
+  <b>{who}</b>
+{/snippet}`, 'utf-8');
+  let msgQ2 = '';
+  try {
+    await compileComponent(tmpQ2, pathQ.join(process.cwd(), 'public'), 'renderearlypage', false, [], new Map());
+  } catch (e) { msgQ2 = String((e as Error).message); }
+  check('F33 render-before-snippet: the diagnostic survives too', msgQ2.includes('runs before its') && !msgQ2.includes('filePath is not defined'), msgQ2.slice(0, 120));
+  safeRm(tmpQ2);
+}
+
 if (failures > 0) {
   console.error(`\n${failures} compiler check(s) FAILED`);
   process.exit(1);

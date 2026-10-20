@@ -19,12 +19,18 @@ import { gunzipSync, brotliDecompressSync } from 'zlib';
 
 const BASE = process.env.ROSEFD_E2E_BASE || 'http://localhost:3000';
 
+// Count refs in the markup the browser PARSES: the inlined bundle is one big
+// <script> whose route templates contain literal <link href="..."> strings
+// (a route's head block) - those are source text, not requests. The bundle
+// escapes every raw </script, so stripping script regions is exact.
+const parsedRefs = (doc: string) => [...doc.replace(/<script[\s\S]*?<\/script>/g, '').matchAll(/<(?:script|link|img)[^>]*(?:src|href)="([^"]+)"/g)]
+  .map((m) => m[1])
+  .filter((u) => !u.startsWith('#') && !u.startsWith('data:'));
+
 const res = await fetch(BASE + '/');
 const html = await res.text();
 
-const externalRefs = [...html.matchAll(/<(?:script|link|img)[^>]*(?:src|href)="([^"]+)"/g)]
-  .map((m) => m[1])
-  .filter((u) => !u.startsWith('#') && !u.startsWith('data:'));
+const externalRefs = parsedRefs(html);
 console.log(`page fetched: ${html.length} bytes, external asset refs: ${externalRefs.length} (expect 0)`);
 if (externalRefs.length > 0) {
   console.error('FAIL: page should need zero extra requests');
@@ -425,9 +431,7 @@ assert(streamHtml.trimEnd().endsWith('</html>'), 'the streamed document closes p
 assert(streamHtml.includes('id="__rosefd_state"'), 'the streamed document carries the state script');
 const streamState = JSON.parse(streamHtml.match(/id="__rosefd_state">([\s\S]*?)<\/script>/)![1]);
 assert(streamState.__route === '/admin', 'the streamed state names the requested route');
-const streamRefs = [...streamHtml.matchAll(/<(?:script|link|img)[^>]*(?:src|href)="([^"]+)"/g)]
-  .map((m) => m[1])
-  .filter((u) => !u.startsWith('#') && !u.startsWith('data:'));
+const streamRefs = parsedRefs(streamHtml);
 assert(streamRefs.length === 0, `the streamed document needs zero extra requests (${streamRefs.length} refs)`);
 assert(/\u27e6h:/.test(streamHtml), 'the streamed body carries the route head markers');
 assert(streamHtml.includes('<title>Rose Frame Driver</title>'), 'the streamed shell serves the default title before the route head exists');
@@ -481,6 +485,11 @@ const aboutRes = await fetch(BASE + '/about');
 const aboutHtml = await aboutRes.text();
 assert(aboutHtml.includes('<title>About Rose Frame Driver - Rose Frame Driver</title>'), 'a prerendered route still serves its full <head>');
 assert(aboutHtml.includes('name="description" content="What Rose Frame Driver is and the ideas it is built on."'), 'the prerendered head carries the route meta');
+// The dynamic path carries the route head as body markers (the client applies
+// them at boot); the baked document's stamped server merge is asserted in
+// test-client. Both same-rel feeds must ride in the markers.
+const aboutHeadMarkers = [...aboutHtml.matchAll(/<!--\u27e6h:\d+\u27e7-->([\s\S]*?)<!--\u27e6\/h:\d+\u27e7-->/g)].map((m) => m[1]).join('');
+assert(aboutHeadMarkers.includes('href="/api/feed.xml"') && aboutHeadMarkers.includes('href="/en/api/feed.xml"'), 'the served about document carries both same-rel feed links in its head markers (bug report 2026-10-13)');
 
 const rawGet = (pathname: string, headers: Record<string, string> = {}) =>
   new Promise<{ status: number; headers: Record<string, string>; body: Buffer }>((resolve, reject) => {
@@ -738,23 +747,39 @@ await tick();
   const assetRes = await fetch(BASE + '/client.js');
   assert(assetRes.status === 200, 'the client bundle is served as a real asset');
   assert(!assetRes.headers.get('content-security-policy'), 'assets carry no page CSP');
-  // A dynamic document answers a conditional request with a bare 304 that
-  // keeps the page headers. Both requests must render the SAME bytes, and
-  // the demo home page carries per-worker in-memory state (store.likes,
-  // bumped by the $action:like POSTs earlier in this suite): under
-  // `rosefd serve`'s cluster two requests can land on workers whose
-  // renders differ. Connection reuse pins the pair to one worker; a socket
-  // recycled by either side's keep-alive timeout just needs another roll.
-  let revalidated: Response | undefined;
-  for (let attempt = 0; attempt < 6 && revalidated?.status !== 304; attempt++) {
-    const fresh = await fetch(BASE + '/');
-    const freshEtag = fresh.headers.get('etag');
-    await fresh.arrayBuffer();
-    if (!freshEtag) break; // no compression negotiated: no validator was minted
-    revalidated = await fetch(BASE + '/', { headers: { 'if-none-match': freshEtag } });
-    await revalidated.arrayBuffer();
+  // A dynamic document answers a conditional request with a bodiless 304 that
+  // keeps the page headers - and, per RFC 9110, the validator itself.
+  //
+  // Only a BUFFERED render can produce that 304: the ETag is a hash of the
+  // whole document, while a streamed render knows its bytes only after its
+  // headers have already left. So this block uses the demo's /buffered route
+  // (it exports `buffer = true`); a conditional GET aimed at a streamable route
+  // takes the buffered path too, so it is answered with a validator instead of
+  // a second stream - but the FIRST visit to a streamable route ships no ETag,
+  // because a header cannot be written after the body started.
+  const buf = await fetch(BASE + '/buffered');
+  const bufCsp = buf.headers.get('content-security-policy');
+  const bufEtag = buf.headers.get('etag');
+  await buf.arrayBuffer();
+  assert(!!bufCsp && !!bufEtag, 'a buffered dynamic document carries its CSP and a validator');
+  assert(bufEtag!.startsWith('W/"'), 'the validator is weak (the encoding is a separate dimension)');
+  const revalidated = await fetch(BASE + '/buffered', { headers: { 'if-none-match': bufEtag! } });
+  await revalidated.arrayBuffer();
+  assert(revalidated.status === 304, `a conditional GET answers 304 (got ${revalidated.status})`);
+  assert(revalidated.headers.get('content-security-policy') === bufCsp, 'the 304 keeps the CSP');
+  assert(revalidated.headers.get('etag') === bufEtag, 'the 304 carries the validator it matched (RFC 9110)');
+  // A streamable route answers a conditional request from the buffered path, so
+  // a client holding a validator (from `rosefd serve`, which buffers dynamic
+  // documents, or from an earlier buffered answer) gets a 304 here too instead
+  // of a stream it cannot use.
+  const streamed = await fetch(BASE + '/');
+  const streamedEtag = streamed.headers.get('etag');
+  await streamed.arrayBuffer();
+  if (streamedEtag) {
+    const s304 = await fetch(BASE + '/', { headers: { 'if-none-match': streamedEtag } });
+    await s304.arrayBuffer();
+    assert(s304.status === 304 && s304.headers.get('etag') === streamedEtag, 'a streamable route honours a validator it did publish');
   }
-  assert(revalidated?.status === 304 && revalidated.headers.get('content-security-policy') === homeCsp, 'the 304 keeps the CSP');
 }
 
 {

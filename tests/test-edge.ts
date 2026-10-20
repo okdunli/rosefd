@@ -47,9 +47,14 @@ assert(res.headers.get('content-type') === 'text/html; charset=utf-8', 'content-
 const html = await res.text();
 assert(html.includes('<div id="app">'), 'document has app container');
 assert(html.includes('__rosefd_state'), 'state serialized into document');
-const externalRefs = [...html.matchAll(/<(?:script|link)[^>]*(?:src|href)="([^"]+)"/g)]
+// Count refs in the markup the browser PARSES: the inlined bundle is one big
+// <script> whose route templates contain literal <link href="..."> strings
+// (a route's head block) - those are source text, not requests. The bundle
+// escapes every raw </script, so stripping script regions is exact.
+const parsedRefs = (doc: string) => [...doc.replace(/<script[\s\S]*?<\/script>/g, '').matchAll(/<(?:script|link)[^>]*(?:src|href)="([^"]+)"/g)]
   .map((m) => m[1])
   .filter((u) => !u.startsWith('#') && !u.startsWith('data:'));
+const externalRefs = parsedRefs(html);
 assert(externalRefs.length === 0, `zero external asset refs (one request) - got ${externalRefs.length}`);
 
 // <style> may carry attributes since route-scoped styles became managed head
@@ -117,9 +122,7 @@ assert(streamDoc.includes('__rosefd_state'), 'the stream carries the state scrip
 assert(streamDoc.trimEnd().endsWith('</html>'), 'the streamed document is complete');
 const streamState = JSON.parse(streamDoc.match(/id="__rosefd_state">([\s\S]*?)<\/script>/)![1]);
 assert(streamState.__route === '/admin', 'the streamed state names the requested route');
-const streamRefs = [...streamDoc.matchAll(/<(?:script|link|img)[^>]*(?:src|href)="([^"]+)"/g)]
-  .map((m) => m[1])
-  .filter((u) => !u.startsWith('#') && !u.startsWith('data:'));
+const streamRefs = parsedRefs(streamDoc);
 assert(streamRefs.length === 0, `the streamed document needs zero extra requests (${streamRefs.length} refs)`);
 const blog42 = await handle(new Request('http://localhost/blog/42'));
 const blog42Html = await blog42.text();
@@ -288,5 +291,31 @@ const likePass = async (headers: Record<string, string>, msg: string) => {
 await likePass({ origin: 'http://localhost' }, "a same-origin POST (the browser's own origin) runs the action");
 await likePass({ 'sec-fetch-site': 'same-origin' }, 'a same-origin Sec-Fetch-Site passes');
 await likePass({}, 'a POST with neither Origin nor Sec-Fetch-Site passes (not CSRF-attackable)');
+
+// --- R53: concurrent requests must not read each other's query ---
+// The edge runtime has no async-local store, so setQuery writes a module-level
+// variable; the runtime's render mutex only starts INSIDE the render. The
+// handler therefore serializes the whole unit (setQuery through response) -
+// without it, two overlapping /search requests each render the other's q.
+// /search echoes $query().q into the rendered input value, so the response
+// body carries whose query won.
+{
+  const qOf = (html: string) => html.match(/<input[^>]*name="q"[^>]*value="([^"]*)"/)?.[1] ?? null;
+  const [rose, thorn] = await Promise.all([
+    handle(new Request('http://localhost/search?q=rose')),
+    handle(new Request('http://localhost/search?q=thorn')),
+  ]);
+  const roseHtml = await rose.text();
+  const thornHtml = await thorn.text();
+  assert(qOf(roseHtml) === 'rose', 'a concurrent /search renders its own query (rose)');
+  assert(qOf(thornHtml) === 'thorn', 'a concurrent /search renders its own query (thorn)');
+  // "rose" matches Hello Rose Frame Driver (title) and Zero-hydration magic (body: "Rose Frame Driver
+  // resumes"); "thorn" matches only The thorn in every stack. The hit sets are
+  // the render's own $data resolution, so they prove the query rode the whole
+  // render, not just the input echo. (The count itself is a dynamic marker, so
+  // the titles are the assertion's target.)
+  assert(roseHtml.includes('Hello Rose Frame Driver') && roseHtml.includes('Zero-hydration magic'), 'the rose query resolves its own hit set');
+  assert(thornHtml.includes('The thorn in every stack') && !thornHtml.includes('Hello Rose Frame Driver'), 'the thorn query resolves its own hit set');
+}
 
 console.log(`\nAll edge adapter checks passed - Web-standard handler, one request, zero hydration - ${checks} assertions.`);

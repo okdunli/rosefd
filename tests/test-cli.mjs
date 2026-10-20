@@ -824,6 +824,438 @@ for (let i = 0; i < 20 && !bindable; i++) {
 }
 assert(bindable, 'no orphan worker holds the port after the primary dies');
 
+// The prod server's hot cache replays memoized headers captured from the edge
+// response - which carries the app's own Vary dimensions but never the server's
+// negotiation dimension (the dynamic path adds that to `res` after the fact).
+// A hot-cache replay therefore used to serve bytes negotiated on Accept-Encoding
+// while telling caches the response does not vary by it. The fixture route is
+// dynamic (getContext), so both requests below are answered by the prod server:
+// the first renders and memoizes, the second replays the hot entry.
+const hotDir = path.join(tmp, 'hotserve');
+fs.mkdirSync(path.join(hotDir, 'src', 'pages'), { recursive: true });
+fs.writeFileSync(path.join(hotDir, 'src', 'pages', 'index.rose'), `<script>\n  const ctx = getContext();\n</script>\n<h1>hot head</h1>\n<p>${'x'.repeat(2000)}</p>\n<p>{ctx ? 'ctx' : 'no'}</p>\n`);
+const hotBuilt = await run(['build'], hotDir);
+assert(hotBuilt.code === 0, `the hot-cache fixture builds (stderr: ${hotBuilt.err.slice(0, 200)})`);
+assert(!fs.existsSync(path.join(hotDir, 'dist', 'index.html')), 'the fixture route is dynamic (nothing baked, every request renders)');
+const hotPort = await takePort(0);
+const hot = spawn(process.execPath, [path.join(hotDir, 'dist', 'prod.mjs')], {
+  cwd: hotDir,
+  env: { ...process.env, PORT: String(hotPort), ROSEFD_WORKERS: '1' },
+});
+try {
+  const hotBase = `http://localhost:${hotPort}`;
+  for (let i = 0; i < 100; i++) {
+    try { await fetch(hotBase + '/'); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  const http3 = await import('node:http');
+  const gzHead = (url) => new Promise((resolve, reject) => {
+    http3.get(url, { agent: new http3.Agent({ keepAlive: false }), headers: { 'accept-encoding': 'gzip' } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.headers));
+    }).on('error', reject);
+  });
+  const miss = await gzHead(hotBase + '/');
+  assert(miss['content-encoding'] === 'gzip', 'the prod server negotiates gzip on the rendered path');
+  assert(miss['vary'] === 'Accept-Encoding', `the rendered path declares the negotiation dimension (got ${miss['vary']})`);
+  await new Promise((r) => setTimeout(r, 400));
+  const hit = await gzHead(hotBase + '/');
+  assert(hit['content-encoding'] === 'gzip', 'the hot-cache path negotiates gzip too');
+  assert(hit['vary'] === 'Accept-Encoding', `the hot-cache replay declares the negotiation dimension (got ${hit['vary']})`);
+} finally {
+  hot.kill();
+}
+
+// The invalidation race: a POST used to clear the hot cache at the TOP of its
+// handler - before the app's write, which commits inside handle() - so a render
+// in flight across the clear stored pre-mutation bytes into the already-cleared
+// cache (stale bytes resurrected for a whole TTL), and the /__rosefd/revalidate
+// endpoint short-circuited ahead of that clear and dropped only the render memo.
+// The fixture: /slow renders slowly behind a per-render counter, /ping is a fast
+// dynamic route the POST lands on, /rev counts its own renders. Cookies keep the
+// cookieless warm storm out of the counts; the per-render counters arrive wrapped
+// in text-marker comments, so the count is read back out of the markup.
+const raceDir = path.join(tmp, 'hotrace');
+fs.mkdirSync(path.join(raceDir, 'src', 'pages'), { recursive: true });
+fs.writeFileSync(path.join(raceDir, 'src', 'pages', 'slow.rose'), `<script>\n  const ctx = getContext();\n  const g = globalThis;\n  g.__rosefd_t_r56_slow = (g.__rosefd_t_r56_slow ?? 0) + 1;\n  let slow = $data(async () => { await new Promise((r) => setTimeout(r, 300)); return 'slow'; });\n</script>\n<h1>n {g.__rosefd_t_r56_slow}</h1>\n<p>{slow()}</p>\n`);
+fs.writeFileSync(path.join(raceDir, 'src', 'pages', 'ping.rose'), `<script>\n  const ctx = getContext();\n</script>\n<h1>ping</h1>\n`);
+fs.mkdirSync(path.join(raceDir, 'src', 'pages', 'api'), { recursive: true });
+fs.writeFileSync(path.join(raceDir, 'src', 'pages', 'api', 'touch.rose'), `<script>\n  export async function POST() { return { ok: true }; }\n</script>\n`);
+fs.writeFileSync(path.join(raceDir, 'src', 'pages', 'rev.rose'), `<script>\n  const ctx = getContext();\n  const g = globalThis;\n  g.__rosefd_t_r56_rev = (g.__rosefd_t_r56_rev ?? 0) + 1;\n</script>\n<h1>r {g.__rosefd_t_r56_rev}</h1>\n`);
+const raceBuilt = await run(['build'], raceDir);
+assert(raceBuilt.code === 0, `the race fixture builds (stderr: ${raceBuilt.err.slice(0, 200)})`);
+const racePort = await takePort(0);
+const race = spawn(process.execPath, [path.join(raceDir, 'dist', 'prod.mjs')], {
+  cwd: raceDir,
+  env: { ...process.env, PORT: String(racePort), ROSEFD_REVALIDATE_TOKEN: 'r56-token' },
+});
+let raceOut = '';
+race.stdout.on('data', (c) => { raceOut += c; });
+race.stderr.on('data', (c) => { raceOut += c; });
+const countOf = (html, letter) => {
+  const m = new RegExp(letter + ' <!--⟦m:\\d+⟧-->(\\d+)').exec(html);
+  return m ? Number(m[1]) : -1;
+};
+try {
+  const raceBase = `http://localhost:${racePort}`;
+  for (let i = 0; i < 100; i++) {
+    // Cookied on purpose: a cookieless first hit would fire the warm storm and
+    // render every route once more, outside the counts below.
+    try { await fetch(raceBase + '/ping', { headers: { cookie: 'ready=1' } }); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  // The boot warm renders every warmList route once through the handler (no
+  // cache involved) - wait for the two counting routes' log lines so the
+  // per-render counters below start from a settled state.
+  for (let i = 0; i < 150; i++) {
+    if (/\[rosefd\] warm \/slow /.test(raceOut) && /\[rosefd\] warm \/rev /.test(raceOut)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const get = (p, cookie) => fetch(raceBase + p, { headers: { cookie } }).then((r) => r.text());
+  // The straddle: a second cookie's miss renders while a POST invalidates.
+  const first = await get('/slow', 'a=1');
+  const firstN = countOf(first, 'n');
+  assert(firstN > 0, `the first miss renders and memoizes (got: ${first.slice(0, 80)})`);
+  const mid = get('/slow', 'b=1');
+  await new Promise((r) => setTimeout(r, 100));
+  const posted = await fetch(raceBase + '/api/touch', { method: 'POST', headers: { cookie: 'a=1', 'content-type': 'application/json' }, body: '{}' });
+  assert(posted.status < 500, `the mutating POST answers (got ${posted.status})`);
+  await mid;
+  const third = await get('/slow', 'b=1');
+  assert(countOf(third, 'n') === firstN + 2, `a render that straddled an invalidation does not store its stale bytes (first ${firstN}, after ${countOf(third, 'n')})`);
+  // The revalidate endpoint short-circuited ahead of the non-GET clear, so it
+  // used to drop only the render memo and leave the hot cache serving the
+  // pre-revalidation bytes for a whole TTL.
+  const rev1 = await get('/rev', 'a=1');
+  const rev1N = countOf(rev1, 'r');
+  assert(rev1N > 0, `the revalidate fixture renders and memoizes (got: ${rev1.slice(0, 80)})`);
+  const revHit = await get('/rev', 'a=1');
+  assert(countOf(revHit, 'r') === rev1N, 'the second read is the hot replay (same bytes)');
+  const revalidated = await fetch(raceBase + '/__rosefd/revalidate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-rosefd-token': 'r56-token' },
+    body: JSON.stringify({ all: true }),
+  });
+  assert(revalidated.status === 200, `the revalidate endpoint answers (got ${revalidated.status})`);
+  const rev2 = await get('/rev', 'a=1');
+  assert(countOf(rev2, 'r') === rev1N + 1, `an explicit revalidation drops the hot entry too, not just the render memo (before ${rev1N}, after ${countOf(rev2, 'r')})`);
+} finally {
+  race.kill();
+}
+
+// The response exit used to write set-cookie with one setHeader per forEach
+// value: setHeader replaces, so a multi-cookie response (session + csrf, say)
+// kept only the last one - a login flow lost its session cookie while the csrf
+// cookie survived, locking every write behind a half-authenticated request.
+// The fixture answers with three cookies through the prod server's own exit;
+// the hot-cache capture/replay is the same class of bug (one object assignment
+// per forEach value), so a cookieless GET pair locks that path as well.
+const cookieDir = path.join(tmp, 'multicookie');
+fs.mkdirSync(path.join(cookieDir, 'src', 'pages', 'api'), { recursive: true });
+fs.writeFileSync(path.join(cookieDir, 'src', 'pages', 'api', 'login.rose'), `<script>
+  export async function POST() {
+    const res = new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    res.headers.append('set-cookie', 'session=abc; Path=/; HttpOnly');
+    res.headers.append('set-cookie', 'csrf=xyz; Path=/');
+    res.headers.append('set-cookie', 'theme=dark; Path=/; Max-Age=600');
+    return res;
+  }
+</script>
+`);
+fs.writeFileSync(path.join(cookieDir, 'src', 'pages', 'api', 'prefs.rose'), `<script>
+  export async function GET() {
+    const res = new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    res.headers.append('set-cookie', 'seen=one; Path=/');
+    res.headers.append('set-cookie', 'seen2=two; Path=/');
+    return res;
+  }
+</script>
+`);
+const cookieBuilt = await run(['build'], cookieDir);
+assert(cookieBuilt.code === 0, `the cookie fixture builds (stderr: ${cookieBuilt.err.slice(0, 200)})`);
+const cookiePort = await takePort(0);
+const cookieSrv = spawn(process.execPath, [path.join(cookieDir, 'dist', 'prod.mjs')], {
+  cwd: cookieDir,
+  env: { ...process.env, PORT: String(cookiePort) },
+});
+let cookieOut = '';
+cookieSrv.stdout.on('data', (c) => { cookieOut += c; });
+cookieSrv.stderr.on('data', (c) => { cookieOut += c; });
+try {
+  const cookieBase = `http://localhost:${cookiePort}`;
+  for (let i = 0; i < 100; i++) {
+    try { await fetch(cookieBase + '/api/prefs'); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  const loginRes = await fetch(cookieBase + '/api/login', { method: 'POST' });
+  assert(loginRes.status === 200, `the cookie fixture answers (got ${loginRes.status})`);
+  const loginCookies = loginRes.headers.getSetCookie?.() ?? [];
+  assert(loginCookies.length === 3, `the multi-cookie response keeps every Set-Cookie header (got ${loginCookies.length}: ${loginCookies.join(' | ')})`);
+  const cookieNames = loginCookies.map((c) => c.split('=')[0]);
+  assert(cookieNames.includes('session') && cookieNames.includes('csrf') && cookieNames.includes('theme'), 'the session, csrf and theme cookies all survive the exit');
+  assert(loginCookies.some((c) => c.startsWith('session=abc') && /HttpOnly/i.test(c)), 'the session cookie keeps its value and its attributes');
+  const prefs1 = await fetch(cookieBase + '/api/prefs');
+  const prefs1Cookies = prefs1.headers.getSetCookie?.() ?? [];
+  assert(prefs1Cookies.length === 2, `the GET response carries both cookies (got ${prefs1Cookies.length}: ${prefs1Cookies.join(' | ')})`);
+  const prefs2 = await fetch(cookieBase + '/api/prefs');
+  const prefs2Cookies = prefs2.headers.getSetCookie?.() ?? [];
+  assert(prefs2Cookies.length === 2, `the hot-cache replay keeps both cookies (got ${prefs2Cookies.length}: ${prefs2Cookies.join(' | ')})`);
+} finally {
+  cookieSrv.kill();
+}
+
+// The hot cache is a SHARED store, and its key used to name only the path and
+// the cookie - so the first language rendered was replayed to every other
+// language for a whole TTL, and boot warm (which sends no accept-language at
+// all) let the app's default win that shared key: an English browser got the
+// Chinese installer (BUG.md AB). The key now carries the negotiated language,
+// and a response that declares itself uncacheable (no-store / no-cache /
+// private / max-age=0) or that varies on a dimension the key does not carry
+// (anything but accept-encoding) never enters the store. The fixture echoes
+// the negotiated language behind a per-render counter; cookies keep the
+// cookieless warm storm out of the counts, and no route declares
+// `export const cache`, so every counter step is a real render - no memo
+// bypass between the lock and the cache under test.
+const langDir = path.join(tmp, 'hotlang');
+fs.mkdirSync(path.join(langDir, 'src', 'pages', 'api'), { recursive: true });
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'echo.rose'), `<script>
+  export async function GET(request) {
+    const al = request.headers.get('accept-language') || 'none';
+    const g = globalThis;
+    g.__rosefd_t_r58_echo = (g.__rosefd_t_r58_echo ?? 0) + 1;
+    return new Response(JSON.stringify({ al, n: g.__rosefd_t_r58_echo }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+</script>
+`);
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'varyroute.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r58_vary = (g.__rosefd_t_r58_vary ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosefd_t_r58_vary }), { status: 200, headers: { 'content-type': 'application/json', vary: 'x-custom' } });
+  }
+</script>
+`);
+// A route can make its own private negotiation header safe by declaring it:
+// `export const hotVary` folds the header into the cache key AND into the warm
+// render that fills it, so the route keeps being cached - partitioned per
+// value - instead of having to tag the URL (?rv=) or opt out with no-store.
+// The response declares the matching Vary, which is what the guard would have
+// refused before the declaration existed.
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'hotdim.rose'), `<script>
+  export const hotVary = ['x-rv-url'];
+  export async function GET(request) {
+    const rv = request.headers.get('x-rv-url') || 'none';
+    const g = globalThis;
+    g.__rosefd_t_r59_dim = (g.__rosefd_t_r59_dim ?? 0) + 1;
+    return new Response(JSON.stringify({ rv, n: g.__rosefd_t_r59_dim }), { status: 200, headers: { 'content-type': 'application/json', vary: 'x-rv-url' } });
+  }
+</script>
+`);
+// The other half of the same rule: accept-language is a dimension the key has
+// always carried, so a route that declares Vary on it must stay cacheable -
+// partitioned per language - rather than lose the cache for the whole route.
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'langvary.rose'), `<script>
+  export async function GET(request) {
+    const al = request.headers.get('accept-language') || 'none';
+    const g = globalThis;
+    g.__rosefd_t_r59_lang = (g.__rosefd_t_r59_lang ?? 0) + 1;
+    return new Response(JSON.stringify({ al, n: g.__rosefd_t_r59_lang }), { status: 200, headers: { 'content-type': 'application/json', vary: 'accept-language' } });
+  }
+</script>
+`);
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'nostore.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r58_nostore = (g.__rosefd_t_r58_nostore ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosefd_t_r58_nostore }), { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+  }
+</script>
+`);
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'encvary.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r58_encvary = (g.__rosefd_t_r58_encvary ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosefd_t_r58_encvary }), { status: 200, headers: { 'content-type': 'application/json', vary: 'accept-encoding' } });
+  }
+</script>
+`);
+// The boundary on the other side: the framework's own dynamic documents carry
+// `cache-control: no-cache` (browsers revalidate HTML every visit), and the
+// hot cache is the server-side revalidation layer for exactly those - a
+// revalidation-freshness directive must NOT keep a response out of the store,
+// or the cache dies for its primary workload. no-store / private are the
+// storage prohibitions and the app's escape valves; no-cache is not.
+fs.writeFileSync(path.join(langDir, 'src', 'pages', 'api', 'nocache.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r58_nocache = (g.__rosefd_t_r58_nocache ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosefd_t_r58_nocache }), { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' } });
+  }
+</script>
+`);
+const langBuilt = await run(['build'], langDir);
+assert(langBuilt.code === 0, `the hot-language fixture builds (stderr: ${langBuilt.err.slice(0, 200)})`);
+const langPort = await takePort(0);
+const lang = spawn(process.execPath, [path.join(langDir, 'dist', 'prod.mjs')], {
+  cwd: langDir,
+  env: { ...process.env, PORT: String(langPort), ROSEFD_WORKERS: '1' },
+});
+let langOut = '';
+lang.stdout.on('data', (c) => { langOut += c; });
+lang.stderr.on('data', (c) => { langOut += c; });
+try {
+  const langBase = `http://localhost:${langPort}`;
+  for (let i = 0; i < 100; i++) {
+    try { await fetch(langBase + '/api/echo', { headers: { cookie: 'a=1' } }); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  const getJson = (p, al) => fetch(langBase + p, { headers: { cookie: 'a=1', 'accept-language': al } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  const dimJson = (p, rv) => fetch(langBase + p, { headers: { cookie: 'a=1', 'accept-language': 'en-US', 'x-rv-url': rv } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  // The language partition: the same path + cookie, negotiated differently,
+  // must render its own bytes - not replay the first language's.
+  const en = await getJson('/api/echo', 'en-US');
+  assert(en.status === 200 && en.body.al === 'en-US', `the first language renders (got ${en.status} ${JSON.stringify(en.body)})`);
+  const fr = await getJson('/api/echo', 'fr-FR');
+  assert(fr.body.al === 'fr-FR', `a second language gets its own render, not the first language's replay (got ${JSON.stringify(fr.body)})`);
+  // The positive lock on the same route: an identical negotiation profile is
+  // still replayed - the cache works, it is just partitioned correctly now.
+  // A fix that simply disabled the hot cache would pass the two assertions
+  // above and fail here.
+  const frAgain = await getJson('/api/echo', 'fr-FR');
+  assert(frAgain.body.n === fr.body.n, `the same language replays the hot entry (the cache still works: ${fr.body.n} then ${frAgain.body.n})`);
+  // A response that varies on a dimension the key does not carry never enters
+  // the store: both reads render.
+  const v1 = await getJson('/api/varyroute', 'en-US');
+  const v2 = await getJson('/api/varyroute', 'en-US');
+  assert(v2.body.n === v1.body.n + 1, `a route that varies beyond accept-encoding is never hot-cached (first ${v1.body.n}, second ${v2.body.n})`);
+  // The same for a response that declares itself uncacheable.
+  const n1 = await getJson('/api/nostore', 'en-US');
+  const n2 = await getJson('/api/nostore', 'en-US');
+  assert(n2.body.n === n1.body.n + 1, `a no-store response is never hot-cached (first ${n1.body.n}, second ${n2.body.n})`);
+  // The boundary: accept-encoding is the one declared dimension the store
+  // already handles (raw bytes, per-request re-negotiation), so it stays
+  // cacheable - a guard that blocked every Vary would fail here.
+  const e1 = await getJson('/api/encvary', 'en-US');
+  const e2 = await getJson('/api/encvary', 'en-US');
+  assert(e2.body.n === e1.body.n, 'a route that varies only on accept-encoding stays hot-cached');
+  // The freshness boundary: no-cache is a revalidation directive (the
+  // framework's own dynamic HTML carries it), not a storage prohibition, so
+  // the store keeps it - only no-store / private opt a response out.
+  const c1 = await getJson('/api/nocache', 'en-US');
+  const c2 = await getJson('/api/nocache', 'en-US');
+  assert(c2.body.n === c1.body.n, 'a no-cache response stays hot-cached (revalidation freshness is the TTL, not a storage ban)');
+  // A declared dimension is a carried dimension: the route below states
+  // Vary: x-rv-url AND names the header with `export const hotVary`, so it is
+  // partitioned per value instead of being refused - the cache keeps working
+  // where the app used to have to tag the URL or opt out entirely.
+  const d1 = await dimJson('/api/hotdim', '/admin/posts');
+  assert(d1.body.rv === '/admin/posts', `the declared header reaches the render (got ${JSON.stringify(d1.body)})`);
+  const d2 = await dimJson('/api/hotdim', '/admin/settings');
+  assert(d2.body.n === d1.body.n + 1, `a declared header partitions the hot cache: two values, two renders (first ${d1.body.n}, second ${d2.body.n})`);
+  const d3 = await dimJson('/api/hotdim', '/admin/posts');
+  assert(d3.body.n === d1.body.n, `the declared-dimension entry replays - the cache still works (${d1.body.n} then ${d3.body.n})`);
+  // The half that only a real TTL expiry can reach: the warm render that
+  // refills this partition must negotiate the declared header too. A
+  // header-less refresh stored under this key would serve 'none' to every
+  // client in the partition for the next TTL - the poisoning returning
+  // through the refresh path.
+  await new Promise((r) => setTimeout(r, 10_500));
+  await dimJson('/api/hotdim', '/admin/posts');
+  await new Promise((r) => setTimeout(r, 3_000));
+  const d4 = await dimJson('/api/hotdim', '/admin/posts');
+  assert(d4.body.rv === '/admin/posts', `the refreshed entry was rendered WITH the declared header (got ${JSON.stringify(d4.body)})`);
+  // accept-language is the dimension the key has always carried, so declaring
+  // Vary on it must not cost the route its cache: cached, and partitioned.
+  const l1 = await getJson('/api/langvary', 'en-US');
+  const l2 = await getJson('/api/langvary', 'fr-FR');
+  assert(l2.body.al === 'fr-FR' && l2.body.n === l1.body.n + 1, `a Vary: accept-language route is cached per language (${l1.body.n} then ${l2.body.n}, got ${JSON.stringify(l2.body)})`);
+  const l3 = await getJson('/api/langvary', 'en-US');
+  assert(l3.body.n === l1.body.n, `and replays within one language - it is cached, not merely correct (${l1.body.n} then ${l3.body.n})`);
+} finally {
+  lang.kill();
+}
+
+// AC (BUG.md): the hot cache used to store and replay responses that carry a
+// Set-Cookie. The key folds the cookie principal, and anonymous visitors share
+// the empty-cookie slot - so a route that issues a cookie on first visit would
+// hand the SAME cookie to every subsequent anonymous visitor: session fixation,
+// or a shared, readable CSRF token. The fix refuses to store a Set-Cookie under
+// the anonymous key (the conservative variant). The fixture issues a per-render
+// unique cookie; a second anonymous request must get its OWN cookie, not the
+// first visitor's replay. A sibling no-cookie route proves the cache still
+// works for normal responses (the fix is targeted, not a blanket cache-off).
+const scDir = path.join(tmp, 'setcookie');
+fs.mkdirSync(path.join(scDir, 'src', 'pages', 'api'), { recursive: true });
+fs.writeFileSync(path.join(scDir, 'src', 'pages', 'api', 'issue.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r60_issue = (g.__rosefd_t_r60_issue ?? 0) + 1;
+    const res = new Response(JSON.stringify({ n: g.__rosefd_t_r60_issue }), { status: 200, headers: { 'content-type': 'application/json' } });
+    res.headers.append('set-cookie', 'sid=' + g.__rosefd_t_r60_issue + '; Path=/; HttpOnly');
+    return res;
+  }
+</script>
+`);
+fs.writeFileSync(path.join(scDir, 'src', 'pages', 'api', 'plain.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosefd_t_r60_plain = (g.__rosefd_t_r60_plain ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosefd_t_r60_plain }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+</script>
+`);
+const scBuilt = await run(['build'], scDir);
+assert(scBuilt.code === 0, `the set-cookie fixture builds (stderr: ${scBuilt.err.slice(0, 200)})`);
+const scPort = await takePort(0);
+const scSrv = spawn(process.execPath, [path.join(scDir, 'dist', 'prod.mjs')], {
+  cwd: scDir,
+  env: { ...process.env, PORT: String(scPort), ROSEFD_WORKERS: '1' },
+});
+let scOut = '';
+scSrv.stdout.on('data', (c) => { scOut += c; });
+scSrv.stderr.on('data', (c) => { scOut += c; });
+try {
+  const scBase = `http://localhost:${scPort}`;
+  for (let i = 0; i < 100; i++) {
+    try { await fetch(scBase + '/api/plain'); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  const anonGet = (p) => fetch(scBase + p).then(async (r) => ({ status: r.status, body: await r.json(), sid: (r.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).find((c) => c.startsWith('sid=')) ?? null }));
+  // First anonymous visitor gets a freshly issued cookie.
+  const a1 = await anonGet('/api/issue');
+  assert(a1.status === 200 && a1.sid && a1.sid.startsWith('sid='), `the first anonymous visitor is issued a cookie (got ${a1.status} ${a1.sid})`);
+  // Second anonymous visitor must get its OWN cookie - not a replay of the
+  // first visitor's (which is the cross-visitor leak BUG.md AC describes).
+  const a2 = await anonGet('/api/issue');
+  assert(a2.status === 200, `the second anonymous request answers (got ${a2.status})`);
+  assert(a2.sid !== a1.sid, `a Set-Cookie is never replayed across anonymous visitors - each gets its own (first ${a1.sid}, second ${a2.sid})`);
+  // And both were real renders, not a cached replay: the counter advanced.
+  assert(a2.body.n === a1.body.n + 1, `the issue route still renders per request - the guard refuses storage, not service (${a1.body.n} then ${a2.body.n})`);
+  // Positive control: a no-cookie response on the same server IS cached.
+  const p1 = await anonGet('/api/plain');
+  const p2 = await anonGet('/api/plain');
+  assert(p1.status === 200 && p2.status === 200, 'the plain route answers');
+  assert(p2.body.n === p1.body.n, `a no-cookie response is still cached - the AC guard is targeted, not a blanket cache-off (${p1.body.n} then ${p2.body.n})`);
+} finally {
+  scSrv.kill();
+}
+
+// The render memo (`export const cache = N`) is the OTHER shared store in the
+// request path, and it was keyed on URL + cookie alone: a route that asked for
+// a render memo AND negotiated its representation replayed one visitor's
+// render for the whole memo TTL. Its key now folds in the same fingerprint
+// (accept-language plus the declared headers). This half is asserted as a
+// wiring contract - the memo is driven in-process by renderPageCached, so the
+// HTTP-level locks above cannot reach it.
+const compilerSrc = fs.readFileSync(path.join(REPO, 'src/compiler/index.ts'), 'utf8');
+assert(/function __dynKey\(pathname: string, cookieHeader: string, search: string, dims: string\)/.test(compilerSrc), 'the render memo has one shared key builder that takes the negotiation dimensions');
+assert(compilerSrc.includes("const c = (cookieHeader || '') + '\\\\u0000' + (dims || '');"), 'the memo key folds the dimensions in beside the cookie');
+assert(compilerSrc.includes("export function peekRenderCache(pathname: string, cookieHeader: string, search = '', dims = '')"), 'the memo peek takes the dimensions');
+assert(compilerSrc.includes("export async function renderPageCached(pathname: string, cookieHeader: string, search = '', dims = '')"), 'the memo render takes the dimensions');
+assert(compilerSrc.includes('__dynCache.get(__dynKey(pathname, cookieHeader, search, dims))'), 'the memo peek hashes the dimensions into its key');
+assert(compilerSrc.includes('const key = __dynKey(pathname, cookieHeader, search, dims);'), 'the memo render hashes the dimensions into its key');
+const edgeSrc = fs.readFileSync(path.join(REPO, 'src/cli/edge.ts'), 'utf8');
+assert(edgeSrc.includes('hotVaryValues(pathname, (mod as any).hotVaryFor'), 'the edge adapter builds the fingerprint from the live request');
+assert(edgeSrc.includes('renderPageCached(pathname, cookieHeader, qs, dims)'), 'the edge adapter passes the fingerprint into the memo');
+const prodSrc = fs.readFileSync(path.join(REPO, 'src/cli/prod-server.ts'), 'utf8');
+assert(prodSrc.includes('headers[names[i]!] = dims[i + 1]!;'), 'the warm render replays the declared headers the entry it fills is keyed by');
+assert(/if \(d === 'accept-language' \|\| carried\.includes\(d\)\) continue;/.test(prodSrc), 'the store guard exempts every dimension the key carries, not just accept-encoding');
+
 const vercel = JSON.parse(fs.readFileSync(path.join(REPO, 'deploy/vercel.json'), 'utf8'));
 assert(vercel.outputDirectory === 'dist', 'vercel.json builds into dist/');
 assert(vercel.buildCommand === 'npm run build', 'vercel.json builds the app the documented way');
@@ -983,6 +1415,39 @@ try {
   devSrv.kill('SIGKILL');
 }
 
+// A runtime (non-bundled) bare-specifier import must resolve under dev. The
+// per-version server copy used to live in the OS temp dir, where ESM's
+// walk-up finds no node_modules - so an import an app deliberately SPLIT to
+// dodge the bundler ('@electric-sql/' + 'pglite') failed under dev while
+// production worked. The copy now lands in the project.
+const bareDir = path.join(tmp, 'devbare');
+fs.mkdirSync(path.join(bareDir, 'src', 'pages'), { recursive: true });
+fs.mkdirSync(path.join(bareDir, 'node_modules', 'dev-bare-probe'), { recursive: true });
+fs.writeFileSync(path.join(bareDir, 'node_modules', 'dev-bare-probe', 'package.json'), JSON.stringify({ name: 'dev-bare-probe', version: '1.0.0', main: 'index.js' }));
+fs.writeFileSync(path.join(bareDir, 'node_modules', 'dev-bare-probe', 'index.js'), 'export const token = "bare-specifier-resolved";\n');
+fs.writeFileSync(path.join(bareDir, 'src', 'pages', 'index.rose'), `<script>\n  let probe = $data(async () => {\n    const spec = 'dev-bare-' + 'probe';\n    const m = await import(spec);\n    return m.token;\n  });\n</script>\n<h1>probe {probe()}</h1>\n`);
+const barePort = await takePort(0);
+const bareSrv = spawn(process.execPath, [...TSX, 'dev'], { cwd: bareDir, env: { ...process.env, PORT: String(barePort) } });
+let bareOut = '';
+bareSrv.stdout.on('data', (c) => { bareOut += c; });
+bareSrv.stderr.on('data', (c) => { bareOut += c; });
+const bareBase = await new Promise((resolve) => {
+  const t = setInterval(() => {
+    const m = /http:\/\/localhost:(\d+)/.exec(bareOut);
+    if (m) { clearInterval(t); resolve(`http://localhost:${m[1]}`); }
+  }, 100);
+  setTimeout(() => { clearInterval(t); resolve(null); }, 30000);
+});
+try {
+  assert(bareBase !== null, `the bare-specifier dev server starts (got: ${bareOut.slice(-200)})`);
+  const bareDoc = await (await fetch(bareBase + '/')).text();
+  assert(bareDoc.includes('bare-specifier-resolved'), 'a split bare-specifier import resolves under dev (the server copy lives in the project, so ESM walk-up finds its node_modules)');
+  const devCopies = fs.readdirSync(path.join(bareDir, '.rosefd-dev'));
+  assert(devCopies.some((f) => /^server-\d+-\d+\.mjs$/.test(f)), 'the dev server copy lands in <project>/.rosefd-dev/, one per version');
+} finally {
+  bareSrv.kill('SIGKILL');
+}
+
 const vitalsDir = path.join(tmp, 'vitals');
 fs.mkdirSync(path.join(vitalsDir, 'src', 'pages'), { recursive: true });
 const vitalsPage = `<script>\n  export const vitals = true;\n  let n = $state(0);\n</script>\n<h1>vitals {n}</h1>\n<button on:click={() => $setState('n', n() + 1)}>+1</button>\n`;
@@ -1140,6 +1605,22 @@ assert(fs.readFileSync(path.join(pubDir, 'dist', 'public', 'icons', 'rose.svg'),
 assert(fs.readFileSync(path.join(pubDir, 'dist', 'public', 'fonts', 'sub', 'deep.txt'), 'utf8').trim() === 'nested twice', 'a twice-nested asset keeps the whole relative path');
 assert(fs.existsSync(path.join(pubDir, 'dist', 'public', 'logo.svg')), 'the flat asset still lands beside the nested ones');
 assert(fs.existsSync(path.join(pubDir, 'dist', 'public', 'icons', 'rose.svg.br')), 'the nested asset gets its precompressed brotli sibling too');
+{
+  // The precompression pass runs in worker threads now: every text file must
+  // still get a sibling, and every sibling must decode back to the exact raw
+  // bytes. Without this, a pool bug could ship truncated or stale .br bytes
+  // that the server then serves instead of the real document.
+  const brExt = new Set(['.html', '.js', '.css', '.json', '.svg', '.txt']);
+  const walkAll = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkAll(path.join(d, e.name)) : [path.join(d, e.name)]));
+  let checked = 0;
+  for (const f of walkAll(path.join(pubDir, 'dist'))) {
+    if (!brExt.has(path.extname(f).toLowerCase())) continue;
+    assert(fs.existsSync(f + '.br'), `${path.relative(pubDir, f)} gets its precompressed sibling`);
+    assert(zlib.brotliDecompressSync(fs.readFileSync(f + '.br')).equals(fs.readFileSync(f)), `${path.relative(pubDir, f)}.br decodes to the raw bytes`);
+    checked++;
+  }
+  assert(checked > 0, 'the fixture build precompressed its text files');
+}
 const pubPort = await takePort(0);
 const pubProc = spawn(process.execPath, [...TSX, 'serve'], {
   cwd: pubDir,

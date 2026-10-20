@@ -42,7 +42,11 @@ const pack = spawn(npm, ['pack', '--json'], { cwd: REPO, encoding: 'utf8', shell
 let packOut = '';
 pack.stdout.on('data', (c) => { packOut += c; });
 const packedInfo = await new Promise((resolve) => pack.on('close', (code) => {
-  try { resolve(JSON.parse(packOut)[0]); } catch { resolve(null); }
+  try {
+    // npm <= 11 answers an array; npm 12 answers an object keyed by package name.
+    const parsed = JSON.parse(packOut);
+    resolve(Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]);
+  } catch { resolve(null); }
 }));
 assert(packedInfo && packedInfo.filename, `npm pack produced a tarball (${packOut.trim().slice(0, 120)})`);
 const tgz = packedInfo.filename;

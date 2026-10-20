@@ -5,7 +5,7 @@
  * single binary (requires `go` on PATH - the binary is built and spawned
  * here, so the number is measured every run, never quoted), and the same
  * invariants at MEDIUM SCALE: a generated 24-route, 12-component app built
- * in both bundle modes and served live - the benchmark that answers what
+ * in all three bundle modes and served live - the benchmark that answers what
  * the minimal demo cannot (do documents stay small once the app is real?).
  */
 
@@ -340,10 +340,9 @@ try {
     if (code !== 0) throw new Error(`the generated app failed to build:\n${err}${out}`);
     return Date.now() - t0;
   };
-  const built = async (mode: 'inline' | 'split', label: string) => {
-    fs.writeFileSync(join(APP, 'src', 'pages', '_layout.rose'), mode === 'split'
-      ? `<script>\n  import Nav from '../components/Nav.rose';\n  import Footer from '../components/Footer.rose';\n  export const prefetch = 'hover';\n  export const bundle = 'split';\n</script>\n<head><title>Scale benchmark</title></head>\n<Nav active="/" />\n<main><slot /></main>\n<Footer />\n`
-      : `<script>\n  import Nav from '../components/Nav.rose';\n  import Footer from '../components/Footer.rose';\n  export const prefetch = 'hover';\n</script>\n<head><title>Scale benchmark</title></head>\n<Nav active="/" />\n<main><slot /></main>\n<Footer />\n`);
+  const built = async (mode: 'inline' | 'split' | 'sliced', label: string) => {
+    const bundleExport = mode === 'inline' ? '' : `\n  export const bundle = '${mode}';`;
+    fs.writeFileSync(join(APP, 'src', 'pages', '_layout.rose'), `<script>\n  import Nav from '../components/Nav.rose';\n  import Footer from '../components/Footer.rose';\n  export const prefetch = 'hover';${bundleExport}\n</script>\n<head><title>Scale benchmark</title></head>\n<Nav active="/" />\n<main><slot /></main>\n<Footer />\n`);
     const dist = join(APP, 'dist');
     const ms = await cliBuild();
     const docs = bakedDocs(dist);
@@ -353,9 +352,18 @@ try {
     console.log(`\nMedium-scale app, ${label} (${PAGE_PATTERNS} route patterns, ${COMPONENT_COUNT} components, built in ${ms} ms):`);
     console.log(`  documents baked: ${docs.length} - ${zero.length} zero-JS (the compiler's verdict, no export), ${inter.length} interactive`);
     if (zero.length > 0) console.log(`  zero-JS document:       raw ${range(zero.map((d) => d.raw))} / gzip ${(Math.min(...zero.map((d) => d.gzip)) / 1024).toFixed(2)}-${(Math.max(...zero.map((d) => d.gzip)) / 1024).toFixed(2)} KB - 0.00 KB JS at ANY scale`);
-    if (inter.length > 0) console.log(`  interactive document:   raw ${range(inter.map((d) => d.raw))} / gzip ${(Math.min(...inter.map((d) => d.gzip)) / 1024).toFixed(2)}-${(Math.max(...inter.map((d) => d.gzip)) / 1024).toFixed(2)} KB - the shared bundle rides in every one`);
+    if (inter.length > 0) console.log(`  interactive document:   raw ${range(inter.map((d) => d.raw))} / gzip ${(Math.min(...inter.map((d) => d.gzip)) / 1024).toFixed(2)}-${(Math.max(...inter.map((d) => d.gzip)) / 1024).toFixed(2)} KB${mode === 'sliced' ? ' - the runtime plus its own route chain, nothing else' : ' - the shared bundle rides in every one'}`);
     if (mode === 'inline') {
       console.log(`  shared bundle:          ${(fs.statSync(join(dist, 'client.js')).size / 1024).toFixed(2)} KB raw / ${(gzipSync(fs.readFileSync(join(dist, 'client.js'))).length / 1024).toFixed(2)} KB gzip - inlined, so a document grows with the FEATURES, never with the route count`);
+    } else if (mode === 'sliced') {
+      const sliceDir = join(dist, 'slices');
+      const slices = fs.existsSync(sliceDir) ? fs.readdirSync(sliceDir).filter((f) => f.endsWith('.js')) : [];
+      const sliceBytes = slices.map((f) => fs.statSync(join(sliceDir, f)).size);
+      const navAt = join(dist, 'nav.js');
+      const navBytes = fs.existsSync(navAt) ? fs.statSync(navAt).size : 0;
+      const navGz = navBytes > 0 ? gzipSync(fs.readFileSync(navAt)).length : 0;
+      console.log(`  sliced mode:            ${slices.length} slices (${(sliceBytes.reduce((a, b) => a + b, 0) / 1024).toFixed(2)} KB raw total) + nav.js ${(navBytes / 1024).toFixed(2)} KB raw / ${(navGz / 1024).toFixed(2)} KB gzip - the other routes' chains ride nav.js, fetched on the first client-side navigation`);
+      console.log(`  (mode C for many-route apps: the document stops growing with the route count AND stays one self-contained request; mode A above stays the default and byte-for-byte the single-request build)`);
     } else {
       const chunkDir = join(dist, 'chunks');
       const chunks = fs.existsSync(chunkDir) ? fs.readdirSync(chunkDir) : [];
@@ -367,6 +375,7 @@ try {
     return { docs, zero, inter, dist };
   };
 
+  const slicedRun = await built('sliced', 'mode C (sliced bundle)');
   const splitRun = await built('split', 'mode B (split bundle)');
   const inlineRun = await built('inline', 'mode A (the default: single document)');
   scaleChecks.push(['the medium app has 20+ route patterns', PAGE_PATTERNS >= 20]);
@@ -375,9 +384,16 @@ try {
   scaleChecks.push(['zero-JS documents carry no script at all', inlineRun.zero.every((d) => !d.js)]);
   const chunkDir = join(splitRun.dist, 'chunks');
   scaleChecks.push(['split mode emits chunks', fs.existsSync(chunkDir) && fs.readdirSync(chunkDir).length > 1]);
+  const sliceDir = join(slicedRun.dist, 'slices');
+  const sliceFiles = fs.existsSync(sliceDir) ? fs.readdirSync(sliceDir).filter((f) => f.endsWith('.js')) : [];
+  scaleChecks.push(['sliced mode emits one slice per interactive pattern plus a nav chunk',
+    sliceFiles.length >= slicedRun.inter.length && fs.existsSync(join(slicedRun.dist, 'nav.js'))]);
   const homeInline = inlineRun.docs.find((d) => d.file === join(inlineRun.dist, 'index.html'))!;
   const homeSplit = splitRun.docs.find((d) => d.file === join(splitRun.dist, 'index.html'))!;
+  const homeSliced = slicedRun.docs.find((d) => d.file === join(slicedRun.dist, 'index.html'))!;
   scaleChecks.push(['the split document is smaller than the inlined one', homeSplit.raw < homeInline.raw]);
+  scaleChecks.push(['the sliced document is smaller than the inlined one', homeSliced.raw < homeInline.raw]);
+  scaleChecks.push(['zero-JS routes are untouched by the packaging', slicedRun.zero.length === inlineRun.zero.length]);
 
   const SCALE_PORT = 8133;
   const scaleTsx = join(process.cwd(), 'node_modules/tsx/dist/cli.mjs');
