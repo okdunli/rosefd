@@ -41,6 +41,30 @@ function run(args, cwd) {
   });
 }
 
+async function stopChild(p) {
+  if (!p || p.exitCode !== null) return;
+  p.kill();
+  await Promise.race([
+    new Promise((resolve) => p.once('close', resolve)),
+    new Promise((resolve) => setTimeout(resolve, 1500)),
+  ]);
+  if (p.exitCode !== null) return;
+  p.kill('SIGKILL');
+  await new Promise((resolve) => p.once('close', resolve));
+}
+
+async function rmTreeStable(dir) {
+  for (let i = 0; i < 30; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (e) {
+      if (e?.code !== 'ENOTEMPTY' || i === 29) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 const tmp = fs.mkdtempSync(path.join(process.env.TEMP || '/tmp', 'rosefd-cli-'));
 const app = path.join(tmp, 'myapp');
 fs.cpSync(path.join(REPO, 'example'), app, { recursive: true });
@@ -2823,9 +2847,10 @@ ${bufHead.replace('buffered nonce', 'plain head')}
     const publicMiss = await fetch(`http://localhost:${nfPort}/nope`);
     assert(publicMiss.status === 404 && (await publicMiss.text()).includes('ROOT-404'), 'the public miss still answers the root 404');
   } finally {
-    nfProc.kill();
+    await stopChild(nfProc);
   }
 }
 
-fs.rmSync(tmp, { recursive: true, force: true });
+await rmTreeStable(tmp);
 console.log(`\nAll CLI checks passed - the framework builds any project, not just its own demo - ${checks} assertions.`);
+process.exit(0);
