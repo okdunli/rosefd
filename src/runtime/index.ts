@@ -9,6 +9,34 @@ type Subscriber = () => void;
 type Cleanup = () => void;
 type SignalEntry = { value: unknown; subs: Set<Subscriber> };
 
+/**
+ * State that must be ONE table even when this module has several copies.
+ *
+ * Every separately-bundled runtime copy (a per-page inline bundle, a lazily
+ * loaded route chunk) imports its own copy of this file, so a bare `let` is
+ * per-copy - and the things these tables are keyed on are NOT per-copy: the
+ * document, the signal keys, the store names, the element identities. Two
+ * copies that each keep their own `directBound` double-bind one element's
+ * handlers; two copies that each keep their own signal map lose every signal
+ * the other one wrote. So the shared tables live on globalThis, first copy in
+ * wins, and the rest adopt the winner's.
+ *
+ * `shared` is for tables that are only ever MUTATED in place (add/delete/set),
+ * never re-bound. For a binding that gets re-assigned use `sharedCell` - a
+ * plain assignment to a `shared` let would update the local binding only and
+ * the other copies would keep reading the stale table.
+ */
+function shared<T>(key: string, init: () => T): T {
+  const g = globalThis as any;
+  return (g[key] ??= init()) as T;
+}
+
+/** A shared slot whose .value is re-assigned over the module's life. */
+function sharedCell<T>(key: string, initial: T): { value: T } {
+  const g = globalThis as any;
+  return (g[key] ??= { value: initial }) as { value: T };
+}
+
 let currentEffect: (() => void) | null = null;
 
 // F43: while an $effect body runs, every signal read lands here (the entry OBJECT).
@@ -36,9 +64,7 @@ function untrack<T>(fn: () => T): T {
 }
 
 // Trade-off: global signal map, shared across all inlined modules
-let signalMap: Map<string, SignalEntry> =
-  (globalThis as any).__rosefd_signalMap ?? new Map();
-(globalThis as any).__rosefd_signalMap = signalMap;
+const signalMap: Map<string, SignalEntry> = shared('__rosefd_signalMap', () => new Map());
 
 // One get-or-create helper shared by state / setState / resumeState.
 function entry(key: string, initial: unknown): { value: unknown; subs: Set<Subscriber> } {
@@ -99,7 +125,7 @@ export function hasState(key: string): boolean {
 }
 
 // === Per-RENDER $data seeding === The compiled `$data(() => loader())` prologue is const __seeded = isSeeded("k"); const [get.
-let seededKeys = new Set<string>();
+const seededKeys: Set<string> = shared('__rosefd_seededKeys', () => new Set());
 
 export function isSeeded(key: string): boolean {
   return renderMaps().seeded.has(key);
@@ -130,7 +156,7 @@ export function setState<T>(key: string, value: T): void {
 }
 
 // F9 ($persist): keys declared with $persist survive reloads — every write lands in localStorage (JSON-encoded under a rosefd: prefix) and every client.
-const persistedKeys = new Set<string>();
+const persistedKeys: Set<string> = shared('__rosefd_persistedKeys', () => new Set());
 
 function writeStorage(key: string, v: unknown): void {
   try {
@@ -158,23 +184,23 @@ export function persistState<T>(key: string, initial: T): [() => T, (v: T) => vo
 }
 
 // F12: the error a {#boundary} just caught — a custom {:fallback} reads it ({$boundaryError()?.message}) to render its own failure UX.
-let lastBoundaryError: Error | null = null;
+const lastBoundaryError = sharedCell<Error | null>('__rosefd_lastBoundaryError', null);
 
 export function $setBoundaryError(e: unknown): void {
-  lastBoundaryError = e instanceof Error ? e : new Error(String(e));
+  lastBoundaryError.value = e instanceof Error ? e : new Error(String(e));
 }
 
 export function $boundaryError(): Error | null {
-  return lastBoundaryError;
+  return lastBoundaryError.value;
 }
 
 
-const cleanups = new Set<Cleanup>();
+const cleanups: Set<Cleanup> = shared('__rosefd_cleanups', () => new Set());
 
 
 let fxOwner: object | null = null;
-const fxByOwner = new WeakMap<object, Set<Cleanup>>();
-const keysByOwner = new WeakMap<object, Set<string>>();
+const fxByOwner: WeakMap<object, Set<Cleanup>> = shared('__rosefd_fxByOwner', () => new WeakMap());
+const keysByOwner: WeakMap<object, Set<string>> = shared('__rosefd_keysByOwner', () => new WeakMap());
 const fxSet = (): Set<Cleanup> => {
   if (!fxOwner) return cleanups;
   let s = fxByOwner.get(fxOwner);
@@ -447,12 +473,12 @@ export function slotBlockMark(
 const MARK_RE = /^\u27e6([milh]):(\d+)\u27e7$/;
 const END_RE = /^\u27e6\/([milh]):(\d+)\u27e7$/;
 
-const wired = new WeakSet<Node>();
+const wired: WeakSet<Node> = shared('__rosefd_wired', () => new WeakSet());
 
-const pendingIslandObservers = new Set<IntersectionObserver>();
+const pendingIslandObservers: Set<IntersectionObserver> = shared('__rosefd_pendingIslandObservers', () => new Set());
 
 const TPL_CACHE_MAX = 512;
-const tplCache = new Map<string, HTMLTemplateElement>();
+const tplCache: Map<string, HTMLTemplateElement> = shared('__rosefd_tplCache', () => new Map());
 
 /** Parse an html string into a DocumentFragment. Parsed templates are cached per string and cloned per call, so repeated renders (keyed each rows, if-branch re-entry) skip the innerHTML parse. */
 export function tpl(html: string): DocumentFragment {
@@ -474,12 +500,16 @@ const HEAD_ATTR = 'data-rosefd-head';
 export const handlers: Record<string, (e: Event) => void> =
   (globalThis as { __rosefd_handlers?: Record<string, (e: Event) => void> }).__rosefd_handlers ??= {};
 
-let actionDispatch: ((name: string, e: Event) => void) | null = null;
+// The action dispatcher the client entry installs. Shared, not per-copy: the
+// elements it dispatches for are in the one document every copy wires, so the
+// last entry to install wins for all of them - the same rule `handlers` and
+// `directives` already follow.
+const actionDispatchCell = sharedCell<((name: string, e: Event) => void) | null>('__rosefd_actionDispatch', null);
 export function setActionDispatcher(fn: (name: string, e: Event) => void): void {
-  actionDispatch = fn;
+  actionDispatchCell.value = fn;
 }
 
-const directBound = new WeakMap<Element, Set<string>>();
+const directBound: WeakMap<Element, Set<string>> = shared('__rosefd_directBound', () => new WeakMap());
 
 /**
  * F5: `use:NAME` element actions - the plugin point for DOM behaviors
@@ -494,14 +524,20 @@ export const directives: Record<string, (el: Element, param?: unknown) => void |
   (globalThis as { __rosefd_directives?: Record<string, (el: Element, param?: unknown) => void | (() => void) | { update?: (p: unknown) => void; destroy?: () => void }> })
     .__rosefd_directives ??= {};
 
-const actionRecords = new WeakMap<Element, { update?: (p: unknown) => void; destroy?: () => void }>();
+const actionRecords: WeakMap<Element, { update?: (p: unknown) => void; destroy?: () => void }> = shared('__rosefd_actionRecords', () => new WeakMap());
 
 /**
  * Apply one route's whole <head> (every block of its chain, page first) to the
  * document: <title> replaces the title, <meta>/<link>/<base> are matched by
- * name/property/rel/charset. First occurrence of a key wins, so a page
+ * name/property, a rel-only <link> by its rel plus target, everything else by
+ * id then tag+position. First occurrence of a key wins, so a page
  * overrides its layouts - the same rule the server's mergeHeadBlocks applies,
- * which is why the two halves agree without talking to each other.
+ * which is why the two halves agree without talking to each other. (A link
+ * keyed by its bare rel used to swallow the second member of every same-rel
+ * group - hreflang alternates, font preloads, multi-size icons, several
+ * feeds; the target now joins the key. `rel="canonical"` is the one spec
+ * singleton and keeps the bare-rel key, so a page's canonical still overrides
+ * its layout's.)
  *
  * The managed set is REBUILT from the block rather than patched element by
  * element: a route's head is the whole truth, so anything the previous route
@@ -525,12 +561,17 @@ export function applyHead(html: string): void {
   for (const el of Array.from(frag.children)) {
     if (el.tagName === 'TITLE') continue;
     const tag = el.tagName.toLowerCase();
-    const identity = el.getAttribute('name')
-      ?? el.getAttribute('property')
-      ?? el.getAttribute('rel')
-      ?? el.getAttribute('charset');
+    const name = el.getAttribute('name');
+    const property = el.getAttribute('property');
+    const rel = el.getAttribute('rel');
+    const charset = el.getAttribute('charset');
+    let identity: string | null;
+    if (name !== null) identity = name;
+    else if (property !== null) identity = property;
+    else if (rel !== null) identity = rel + linkIdentitySuffix(rel, el);
+    else identity = charset;
     let managed: string;
-    if (identity) managed = `${tag}:${identity}`;
+    if (identity) managed = `${tag}:${identity}`.replace(/"/g, '');
     else if (el.id) managed = `${tag}:${el.id}`;
     else {
       const n = positional.get(tag) ?? 0;
@@ -544,7 +585,17 @@ export function applyHead(html: string): void {
   }
 }
 
-/** Drop every rosefd-managed head element (routes without <head> blocks). */
+/**
+ * The suffix that joins a rel-only link's identity key - the client half of
+ * the server's linkIdentitySuffix, same rule: `canonical` is a singleton
+ * (first wins, page over layout), every other rel carries its target.
+ */
+function linkIdentitySuffix(rel: string, el: Element): string {
+  if (/(^|\s)canonical(\s|$)/i.test(rel)) return '';
+  return `@${el.getAttribute('href') ?? el.getAttribute('type') ?? el.getAttribute('as') ?? ''}`;
+}
+
+/** Drop every Rose Frame Driver-managed head element (routes without <head> blocks). */
 export function clearHead(): void {
   document.head.querySelectorAll(`[${HEAD_ATTR}]`).forEach((el) => el.remove());
 }
@@ -1392,7 +1443,7 @@ export function wire(root: Node, closes: Array<unknown>, scope?: unknown): Clean
       const listener = (e: Event) => {
         if (!el.hasAttribute(an)) return;
         if (spec.startsWith('$action:')) {
-          if (actionDispatch) actionDispatch(spec.slice('$action:'.length), e);
+          if (actionDispatchCell.value) actionDispatchCell.value(spec.slice('$action:'.length), e);
           return;
         }
         const h = handlers[spec];
@@ -1432,7 +1483,7 @@ export function $data<T>(fn: () => T | Promise<T>): Promise<T> {
   return p as Promise<T>;
 }
 
-const bffCache: Map<string, Promise<unknown>> = new Map();
+const bffCache: Map<string, Promise<unknown>> = shared('__rosefd_bffCache', () => new Map());
 
 export function loader<T>(key: string, fn: () => Promise<T>): Promise<T> {
   let p = bffCache.get(key) as Promise<T> | undefined;
@@ -1479,21 +1530,66 @@ export function clearRequestState(): void {
  * without a store the swap is the old process-wide one, correct for the
  * single-render fallback. dataCache needs no swap at all under a store - it
  * already rides the async chain; see renderMaps().
+ *
+ * "correct for the single-render fallback" needed one more thing: a promise
+ * that renders really are single. Without a context store (edge, client) the
+ * swap rewrites the FIELDS of the one shared maps object, so two overlapping
+ * renders interleave their swaps - the second overwrites the first's fresh
+ * tables, the first's finally restores the process-wide pair out from under
+ * the second, and both then read each other's signals, seeded keys and $data
+ * cache (the edge handler answers concurrent requests exactly this way, and
+ * the client's hover prefetch overlaps the click render the same way). The
+ * fallback path therefore takes a process-wide render mutex first: one render
+ * at a time, and the swap is sound again. Under a context store the mutex is
+ * skipped - each chain already carries its own maps, and serialising there
+ * would cap Node's throughput for no correctness gain.
  */
 export async function isolateRender<T>(fn: () => Promise<T>): Promise<T> {
-  const maps = renderMaps();
-  const savedSignals = maps.signals;
-  const savedSeeded = maps.seeded;
-  maps.signals = new Map();
-  maps.seeded = new Set();
-  maps.data.clear();
+  if (contextStore) {
+    const maps = renderMaps();
+    const savedSignals = maps.signals;
+    const savedSeeded = maps.seeded;
+    maps.signals = new Map();
+    maps.seeded = new Set();
+    maps.data.clear();
+    try {
+      return await fn();
+    } finally {
+      maps.signals = savedSignals;
+      maps.seeded = savedSeeded;
+    }
+  }
+  // Fallback (no async-local store): serialise. The queue is a promise chain,
+  // so waiters run in arrival order and a throwing render still releases.
+  // The queue itself is shared across bundle copies (the maps it protects are),
+  // so a per-page bundle's background render cannot interleave with another
+  // copy's - a module-level mutex would only order this copy's own renders.
+  const prev = renderMutexCell.value;
+  let release!: () => void;
+  renderMutexCell.value = new Promise<void>((r) => { release = r; });
+  await prev;
   try {
-    return await fn();
+    const maps = renderMaps();
+    const savedSignals = maps.signals;
+    const savedSeeded = maps.seeded;
+    maps.signals = new Map();
+    maps.seeded = new Set();
+    maps.data.clear();
+    try {
+      return await fn();
+    } finally {
+      maps.signals = savedSignals;
+      maps.seeded = savedSeeded;
+    }
   } finally {
-    maps.signals = savedSignals;
-    maps.seeded = savedSeeded;
+    release();
   }
 }
+
+// The tail of the fallback render queue; see isolateRender. Shared across
+// bundle copies because the tables the renders swap are shared; a module-level
+// mutex would order one copy's renders and let another copy's interleave.
+const renderMutexCell = sharedCell<Promise<void>>('__rosefd_renderMutex', Promise.resolve());
 
 let requestQuery: Record<string, string> = {};
 let prefetchOverride: Record<string, string> | null = null;
@@ -1558,7 +1654,12 @@ let contextStore: ContextStore | null = null;
  */
 const RENDER_MAPS = Symbol('renderMaps');
 type RenderMaps = { data: Map<string, Promise<unknown>>; signals: Map<string, SignalEntry>; seeded: Set<string> };
-let fallbackRenderMaps: RenderMaps = { data: new Map(), signals: signalMap, seeded: seededKeys };
+// The fallback is shared for the same reason the signal map is: without a
+// context store (edge, client) every copy of this module falls back to the
+// same single-render maps, so a $data promise or a seeded key written by one
+// copy's render is visible to the next one's - which is exactly what a
+// client-side navigation between two separately-bundled routes needs.
+const fallbackRenderMaps: RenderMaps = shared('__rosefd_fallbackRenderMaps', () => ({ data: new Map(), signals: signalMap, seeded: seededKeys }));
 
 function renderMaps(): RenderMaps {
   const scoped = contextStore?.getStore();
@@ -1703,8 +1804,8 @@ export function resumeState(json: string): void {
 }
 
 const SDUI_TAGS = ['div', 'span', 'a', 'p', 'img', 'ul', 'li', 'button', 'input', 'section', 'h1', 'h2', 'h3', 'nav', 'header', 'footer', 'form', 'label', 'strong', 'em', 'table', 'tr', 'td', 'code', 'pre', 'article', 'main', 'aside'];
-const sduiTagToId = new Map(SDUI_TAGS.map((t, i) => [t, i]));
-const sduiIdToTag = new Map(SDUI_TAGS.map((t, i) => [i, t]));
+const sduiTagToId: Map<string, number> = shared('__rosefd_sduiTagToId', () => new Map(SDUI_TAGS.map((t, i) => [t, i])));
+const sduiIdToTag: Map<number, string> = shared('__rosefd_sduiIdToTag', () => new Map(SDUI_TAGS.map((t, i) => [i, t])));
 
 export interface SduiNode {
   t: string;
@@ -1731,17 +1832,20 @@ export function decodeSdui(json: string): SduiNode {
   return dec(JSON.parse(json));
 }
 
-let refreshHook: (() => Promise<void>) | null = null;
+// The SWR refresh hook the client entry installs - shared like the action
+// dispatcher: it drives the one document every copy wired, last install wins.
+const refreshHookCell = sharedCell<(() => Promise<void>) | null>('__rosefd_refreshHook', null);
 
 export function setRefreshHook(fn: () => Promise<void>): void {
-  refreshHook = fn;
+  refreshHookCell.value = fn;
 }
 
 export function refresh(): Promise<void> {
-  return refreshHook ? refreshHook() : Promise.resolve();
+  const hook = refreshHookCell.value;
+  return hook ? hook() : Promise.resolve();
 }
 
-const mountQueue: Array<() => void> = [];
+const mountQueue: Array<() => void> = shared('__rosefd_mountQueue', () => []);
 
 export function onMount(fn: () => void): void {
   if (typeof document === 'undefined') return;
@@ -1774,23 +1878,39 @@ export function adoptCleanups(fns: Iterable<Cleanup>): void {
   for (const fn of fns) cleanups.add(fn);
 }
 
-let LOCALES: Record<string, Record<string, string>> = {};
-let DEFAULT_LOCALE = 'en';
-let LOCALE_PACKS: string[] = [];
+// The locale catalog. One cell, not three lets: setLocales/setLocalePacks
+// RE-BIND these, and a plain re-bound `let` would leave every other copy of
+// this module reading the pre-install values - a second bundle's $t would
+// answer in the build default no matter what language the app is in. The cell
+// is why the writes are visible across copies.
+const localeCell = sharedCell<{
+  dicts: Record<string, Record<string, string>>;
+  def: string;
+  packs: string[];
+}>('__rosefd_localeCell', { dicts: {}, def: 'en', packs: [] });
 
 export function setLocales(dicts: Record<string, Record<string, string>>, def: string): void {
-  LOCALES = dicts;
-  DEFAULT_LOCALE = def;
+  const c = localeCell.value;
+  // MERGE, never replace. Every copy of this module ships the subset of the
+  // catalog its own build inlined (the rest arrive as runtime packs), so one
+  // copy's install must not drop the languages another copy brought: in a
+  // process that hosts both the server bundle and a client bundle the client's
+  // two-language subset used to wipe the server's full catalog, and every
+  // server render of the packed locale fell back to the default.
+  c.dicts = { ...c.dicts, ...dicts };
+  if (def) c.def = def;
 }
 
 /** The locales the build left out of this bundle (generated code calls this). */
 export function setLocalePacks(langs: string[]): void {
-  LOCALE_PACKS = langs;
+  const c = localeCell.value;
+  for (const l of langs) if (!c.packs.includes(l)) c.packs.push(l);
 }
 
 /** Merge a dictionary that arrived at runtime - a fetched pack, or an app's own import(). */
 export function loadLocale(lang: string, dict: Record<string, string>): void {
-  LOCALES[lang] = { ...LOCALES[lang], ...dict };
+  const c = localeCell.value;
+  c.dicts[lang] = { ...c.dicts[lang], ...dict };
 }
 
 /**
@@ -1802,7 +1922,8 @@ export function loadLocale(lang: string, dict: Record<string, string>): void {
  * calling loadLocale() itself.
  */
 export async function ensureLocale(lang: string): Promise<void> {
-  if (LOCALES[lang] || !LOCALE_PACKS.includes(lang)) return;
+  const c = localeCell.value;
+  if (c.dicts[lang] || !c.packs.includes(lang)) return;
   try {
     const res = await fetch(`/locales/${encodeURIComponent(lang)}.json`);
     if (res.ok) loadLocale(lang, await res.json());
@@ -1812,11 +1933,12 @@ export async function ensureLocale(lang: string): Promise<void> {
 }
 
 export function localeList(): string[] {
-  return Object.keys(LOCALES);
+  return Object.keys(localeCell.value.dicts);
 }
 
 export function isLocale(lang: string): boolean {
-  return Object.hasOwn(LOCALES, lang) || LOCALE_PACKS.includes(lang);
+  const c = localeCell.value;
+  return Object.hasOwn(c.dicts, lang) || c.packs.includes(lang);
 }
 
 /**
@@ -1889,7 +2011,7 @@ export function localeDir(lang: string): string {
 const ICU_RE = /\{([\w$]+),\s*(plural|selectordinal|select),\s*((?:\s*[=\w]+\s*\{(?:[^{}]|\{[^{}]*\})*\})*)\}/g;
 const BRANCH_RE = /([=\w]+)\s*\{((?:[^{}]|\{[^{}]*\})*)\}/g;
 
-const PLURAL_RULES = new Map<string, Intl.PluralRules>();
+const PLURAL_RULES: Map<string, Intl.PluralRules> = shared('__rosefd_pluralRules', () => new Map());
 
 /** The CLDR category of `n` in `locale`, or null where Intl has no answer. */
 function pluralCategory(locale: string, ordinal: boolean, n: number): string | null {
@@ -1929,16 +2051,20 @@ function expandIcu(msg: string, vars: Record<string, string | number> | undefine
  * re-runs the marker, so only the translated nodes repaint.
  */
 export function $t(key: string, vars?: Record<string, string | number>): string {
-  const [lang] = state('lang', DEFAULT_LOCALE);
-  const dict = LOCALES[lang()] ?? LOCALES[DEFAULT_LOCALE] ?? {};
+  const c = localeCell.value;
+  const [lang] = state('lang', c.def);
+  const dict = c.dicts[lang()] ?? c.dicts[c.def] ?? {};
   const msg = dict[key];
   let out = expandIcu(typeof msg === 'string' ? msg : key, vars, lang());
   if (vars) for (const k in vars) out = out.split(`{${k}}`).join(String(vars[k]));
   return out;
 }
 
-const STORES = new Map<string, { value: unknown; subs: Set<Subscriber> }>();
-let storeTransport: ((name: string, value: unknown) => void) | null = null;
+const STORES: Map<string, { value: unknown; subs: Set<Subscriber> }> = shared('__rosefd_stores', () => new Map());
+// The SSE transport for $store - shared like the dispatcher and the refresh
+// hook: it is installed once per page by the client entry, and every copy's
+// store writes must travel over the one channel that entry opened.
+const storeTransportCell = sharedCell<((name: string, value: unknown) => void) | null>('__rosefd_storeTransport', null);
 
 // A store write (or an applied patch) fans out to whoever read the store inside a
 // tracked scope - the wire() effects that render {store.get()} / {#each store.get()}.
@@ -1964,7 +2090,7 @@ function notifyStoreSubs(box: { subs: Set<Subscriber> }): void {
  * process is one copy, which is already correct. Pass null to detach.
  */
 export function setStoreTransport(fn: ((name: string, value: unknown) => void) | null): void {
-  storeTransport = fn;
+  storeTransportCell.value = fn;
 }
 
 /** Apply a patch that arrived from another process (the transport's receiver
@@ -2004,12 +2130,12 @@ export function $store<T>(name: string, initial: T): { get(): T; set(v: T): void
     set: (v: T) => {
       box.value = v;
       notifyStoreSubs(box);
-      storeTransport?.(name, v);
+      storeTransportCell.value?.(name, v);
     },
     update: (fn: (v: T) => T) => {
       box.value = fn(box.value as T);
       notifyStoreSubs(box);
-      storeTransport?.(name, box.value);
+      storeTransportCell.value?.(name, box.value);
     },
   };
 }
@@ -2017,7 +2143,7 @@ export function $store<T>(name: string, initial: T): { get(): T; set(v: T): void
 // === Network listeners (isomorphic) ===
 // $udp / $tcp / $listen / $websocket let an app open a socket and react to the
 // outside world (LoRa gateways, MQTT-ish feeds, raw TCP devices, live dashboards)
-// from inside a rosefd app. They only REGISTER a spec here; the host binds them
+// from inside a Rose Frame Driver app. They only REGISTER a spec here; the host binds them
 // via __startNetwork() at serve-worker boot - so a build, a prerender, or a dev
 // hot-re-import never opens a socket. The registries live on globalThis: a dev
 // re-import re-registers specs against the same live handles.
@@ -2705,7 +2831,7 @@ export const $prepend = (value: unknown): StateDelta => new StateDelta('p', valu
 /** Shallow-merge an object into an object-valued state key. */
 export const $merge = (value: Record<string, unknown>): StateDelta => new StateDelta('m', value);
 
-const pendingDeltas = new Map<string, StateDelta>();
+const pendingDeltas: Map<string, StateDelta> = shared('__rosefd_pendingDeltas', () => new Map());
 
 /** Record the deltas of the action that just ran (the dispatch calls this). */
 export function setStateDelta(key: string, delta: StateDelta): void {
