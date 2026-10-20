@@ -1,0 +1,10 @@
+<script>
+  let count = $state(0);
+  function bump() { $setState('count', count() + 1); }
+</script>
+
+<div>
+  <h1>slice-home</h1>
+  <p>home count <strong>{count()}</strong></p>
+  <button on:click={bump}>home bump</button>
+</div>

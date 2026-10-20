@@ -18,7 +18,7 @@ declare function $setState<T>(key: string, value: T): void;
 /**
  * Computed state: compiles to a plain getter over the signals the expression
  * reads, so every read recomputes - no subscription machinery, never
- * serialized. Top-level declarations only. The expression is rosefd syntax
+ * serialized. Top-level declarations only. The expression is Rose Frame Driver syntax
  * (bare state reads are callified at compile time), so it checks as `any`.
  */
 declare function $derived(expr: any): Getter<any>;
@@ -197,7 +197,7 @@ interface UDPSocket {
 }
 
 /**
- * Listen for UDP datagrams (LoRa gateways, sensor feeds) from inside a rosefd
+ * Listen for UDP datagrams (LoRa gateways, sensor feeds) from inside a Rose Frame Driver
  * app. Only registers the spec; the framework binds it at serve-worker boot, so
  * a build/prerender never opens a socket.
  */

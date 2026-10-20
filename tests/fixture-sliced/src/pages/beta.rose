@@ -1,0 +1,14 @@
+<script>
+  let betaCount = $state(20);
+  function betaBump() { $setState('betaCount', betaCount() + 1); }
+  // $query() is the bridge's polarity probe: the nav chunk's render must read
+  // the override the SLICE set (one runtime copy), not a chunk-local {}.
+  let q = $state($query().q ?? '(none)');
+</script>
+
+<div>
+  <h1>slice-beta</h1>
+  <p>beta count <strong>{betaCount()}</strong></p>
+  <button on:click={betaBump}>beta bump</button>
+  <p>query <strong>{q()}</strong></p>
+</div>

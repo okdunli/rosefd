@@ -1,0 +1,10 @@
+<script>
+  let alphaCount = $state(10);
+  function alphaBump() { $setState('alphaCount', alphaCount() + 1); }
+</script>
+
+<div>
+  <h1>slice-alpha</h1>
+  <p>alpha count <strong>{alphaCount()}</strong></p>
+  <button on:click={alphaBump}>alpha bump</button>
+</div>

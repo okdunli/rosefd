@@ -1,0 +1,26 @@
+<script>
+  // The mode under test: every interactive document inlines the runtime plus
+  // ITS OWN route's render chain; the other routes ride the shared nav chunk.
+  export const bundle = 'sliced';
+
+  let links = $state([
+    { href: '/', label: 'Home' },
+    { href: '/alpha', label: 'Alpha' },
+    { href: '/beta', label: 'Beta' }
+  ]);
+</script>
+
+<head>
+  <title>Sliced fixture</title>
+</head>
+
+<div>
+  <nav>
+    {#each links() as link}
+      <a href={link.href}>{link.label}</a>
+    {/each}
+  </nav>
+  <main>
+    <slot />
+  </main>
+</div>
