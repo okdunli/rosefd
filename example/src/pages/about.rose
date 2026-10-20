@@ -56,6 +56,13 @@
        document (mergeHeadBlocks) and is adopted, replaced and dropped like any
        other managed head element (applyHead). -->
   <style>.rfetch { color: #2e7d32; font-variant-numeric: tabular-nums; }</style>
+  <!-- Two same-rel links on purpose (bug report 2026-10-13): feed discovery,
+       hreflang alternates and font preloads used to lose every member but the
+       first, because a rel-only identity key made the second link a duplicate
+       of the first. The target now joins the key, so both feeds reach the
+       document - server-merged and client-applied alike. -->
+  <link rel="alternate" type="application/rss+xml" href="/api/feed.xml" title="Rose Frame Driver feed">
+  <link rel="alternate" type="application/rss+xml" href="/en/api/feed.xml" title="Rose Frame Driver feed (English)">
 </head>
 
 <style>
