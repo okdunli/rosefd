@@ -72,6 +72,8 @@ export interface CompileResult {
   usesStore?: boolean;
   revalidate?: number;
   cache?: number;
+  /** request headers this route's representation is negotiated on, beyond cookie/accept-language - folded into every shared cache key (see hot-vary.ts) */
+  hotVary?: string[];
   csr?: boolean;
   /**
    * still needs it - comments widgets, third-party scripts) but drop the
@@ -553,18 +555,19 @@ export function templateExprSpans(src: string): Array<{ start: number; end: numb
 }
 
 /**
- * The FIRST expression span only, stopping at it. compileTemplate's loop
- * asks for "the next construct" once per iteration over a shrinking
- * `remaining`; building the whole span array there (templateExprSpans(src)[0])
- * scanned - and allocated for - every span still ahead on every iteration,
- * which is quadratic in the template size. Same answer, one span.
+ * The FIRST expression span only, at or after `from`, stopping at it.
+ * compileTemplate's loop asks for "the next construct" once per iteration
+ * over a shrinking `remaining`; building the whole span array there
+ * (templateExprSpans(src)[0]) scanned - and allocated for - every span still
+ * ahead on every iteration, which is quadratic in the template size. Same
+ * answer, one span, and absolute positions so the caller can cache it.
  */
-function firstExprSpan(src: string): { start: number; end: number; expr: string } | null {
-  let i = 0;
+function firstExprSpanFrom(src: string, from: number): { index: number; end: number; expr: string } | null {
+  let i = from;
   while (i < src.length) {
     if (src[i] === '{') {
       const end = scanExprEnd(src, i);
-      if (end > i + 1) return { start: i, end, expr: src.slice(i + 1, end) };
+      if (end > i + 1) return { index: i, end, expr: src.slice(i + 1, end) };
     }
     i++;
   }
@@ -905,6 +908,19 @@ export interface RoseFdConfig {
   plugins: Plugin[];
   i18n: I18nConfig;
   pwa?: PwaOptions;
+  brotli?: BrotliConfig;
+}
+
+/**
+ * Build-time precompression (`dist/<file>.br`, written by `rosefd build`).
+ * `quality` defaults to 11 - the brotli maximum, and the right default for the
+ * bytes a visitor downloads: the file is compressed once per build and served
+ * from memory forever. The curve is brutally steep though (measured on a 520KB
+ * prerendered page: q11 862ms/15,143B, q10 92ms/15,945B, q9 15ms/16,452B), so
+ * a large app may prefer q10 - a 9x cheaper cold build for ~5% more bytes.
+ */
+export interface BrotliConfig {
+  quality?: number;
 }
 
 export async function loadConfig(root: string): Promise<RoseFdConfig> {
@@ -915,6 +931,7 @@ export async function loadConfig(root: string): Promise<RoseFdConfig> {
     plugins: (mod.default as Plugin[] | undefined) ?? [],
     i18n: (mod.i18n as I18nConfig | undefined) ?? {},
     pwa: (mod.pwa as PwaOptions | undefined) ?? undefined,
+    brotli: (mod.brotli as BrotliConfig | undefined) ?? undefined,
   };
 }
 
@@ -987,7 +1004,7 @@ function rewriteRoseImports(script: string, kind: 'ssr' | 'client'): string {
 /**
  * The specifiers that can never reach a browser
  * bundle. Node builtins by prefix, plus the database drivers the docs tell
- * you to use - the packages a rosefd app reaches for on the server and
+ * you to use - the packages a Rose Frame Driver app reaches for on the server and
  * nowhere else.
  *
  * Trade-off: a specifier list, not a resolver. A package that merely LOOKS
@@ -1306,6 +1323,48 @@ async function compileComponentMemo(
   return result;
 }
 
+// `export const hotVary = ['x-rv-url']` - the request headers this route's
+// representation is negotiated on, beyond the two the server key already
+// carries (cookie and accept-language). The shared caches are keyed on URL +
+// cookie + language, so a route that reads a private header of its own had one
+// client's bytes replayed to another for a whole TTL (BUG.md AB) - and the
+// app's only exits were a query tag (?l=, ?rv=) or no-store, which switches
+// the cache off for the route entirely. Naming the header here folds it into
+// the key AND into the warm render that fills it: the cache keeps serving,
+// partitioned per value. Parsed identically for pages and api routes.
+function parseHotVary(rawScript: string, filePath: string): string[] | undefined {
+  const m = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+hotVary\s*=\s*\[([\s\S]*?)\]\s*;?/);
+  if (!m) return undefined;
+  const dims: string[] = [];
+  for (const part of m[1]!.split(',')) {
+    const token = part.trim().replace(/^['"`]|['"`]$/g, '');
+    if (!token) continue;
+    const dim = token.toLowerCase();
+    if (!/^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(dim)) {
+      throw new RoseError(
+        'E-EXPORT',
+        `${filePath}: export const hotVary must list request header names (got '${token}')`,
+        { file: filePath, line: lineAt(rawScript, m), hint: "hotVary is a list of the request headers this route negotiates on, e.g. export const hotVary = ['x-locale', 'x-rv-url']" },
+      );
+    }
+    // accept-encoding is negotiated per request from the stored raw bytes, so
+    // partitioning on it would only multiply identical entries.
+    if (dim === 'accept-encoding') {
+      throw new RoseError(
+        'E-EXPORT',
+        `${filePath}: hotVary must not name accept-encoding - the server stores raw bytes and re-negotiates the encoding on every request`,
+        { file: filePath, line: lineAt(rawScript, m), hint: 'drop accept-encoding from hotVary; it is already handled per request' },
+      );
+    }
+    // cookie and accept-language are already in the key; naming them is a no-op
+    // and is dropped rather than rejected, so the declaration can stay
+    // readable as the route's full negotiation surface.
+    if (dim === 'cookie' || dim === 'accept-language') continue;
+    if (!dims.includes(dim)) dims.push(dim);
+  }
+  return dims.length ? dims : undefined;
+}
+
 export async function compileComponent(filePath: string, publicDir: string, scopeKey: string, isApi = false, plugins: Plugin[] = [], registry: RoseRegistry = new Map()): Promise<CompileResult> {
   let source = await fs.promises.readFile(filePath, 'utf-8');
   for (const p of plugins) {
@@ -1350,6 +1409,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
       hasPrerender,
       usesContext,
       usesStore,
+      hotVary: parseHotVary(rawScript, filePath),
     };
   }
 
@@ -1404,6 +1464,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   const revalidate = revalidateMatch ? Number(revalidateMatch[1]) : undefined;
   const cacheMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+cache\s*=\s*(\d+)\s*;?/);
   const cacheSeconds = cacheMatch ? Number(cacheMatch[1]) : undefined;
+  const hotVary = parseHotVary(rawScript, filePath);
   const prefetchMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+prefetch\s*=\s*['"`](\w+)['"`]\s*;?/);
   const prefetch = prefetchMatch ? prefetchMatch[1] : undefined;
   if (prefetch && !['off', 'hover', 'viewport', 'all'].includes(prefetch)) {
@@ -1433,11 +1494,11 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   }
   const bundleMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+bundle\s*=\s*['"`](\w+)['"`]\s*;?/);
   const bundle = bundleMatch ? bundleMatch[1] : undefined;
-  if (bundle && !['inline', 'split'].includes(bundle)) {
+  if (bundle && !['inline', 'split', 'sliced'].includes(bundle)) {
     throw new RoseError(
       'E-EXPORT',
-      `${filePath}: export const bundle must be 'inline' or 'split'`,
-      { file: filePath, line: lineAt(rawScript, bundleMatch), hint: "'inline' (default) is the single-document mode; 'split' is mode B for large apps - route-level chunks, loaded on demand" },
+      `${filePath}: export const bundle must be 'inline', 'split' or 'sliced'`,
+      { file: filePath, line: lineAt(rawScript, bundleMatch), hint: "'inline' (default) is the single-document mode; 'split' is mode B for large apps - route-level chunks, loaded on demand; 'sliced' inlines the runtime plus each route's own render chain and shares the rest via a nav chunk" },
     );
   }
   const csrMatch = rawScript.match(/(?:^|\n)\s*export\s+(?:const|let|var)\s+csr\s*=\s*(true|false)\s*;?/);
@@ -1784,6 +1845,7 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
   // One file, one naming sequence: the internal {@const} thunk names restart
   // here so they are stable and reviewable in the emitted output.
   constUid = 0;
+  sourceFilePath = filePath;
   hoistedConstNames = new Set();
   hoistTopLevelConsts = true;
   const compiledTemplate = compileTemplate(ssrTemplate, 'h', '__c', null, 0, true, comps);
@@ -1856,6 +1918,7 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     usesStore,
     revalidate,
     cache: cacheSeconds,
+    hotVary,
     csr,
     shell,
     buffer,
@@ -3000,7 +3063,7 @@ function expandAwaitBlocks(template: string, filePath: string): { template: stri
         file: filePath, hint: 'write {#await fetchUsers()}...{:then users}...{/await}' });
     }
     // `{#await p then users}` (the branch inline in the opener) is not the
-    // syntax - rosefd spells it with a {:then users} line inside the block.
+    // syntax - Rose Frame Driver spells it with a {:then users} line inside the block.
     // Left alone the opener leaks into the output as literal text, so refuse
     // it here. A trailing word after then/catch is the tell: a promise method
     // call (`p.then(r => …)`, `p.catch(e => …)`) is followed by `(`, never a
@@ -3118,9 +3181,22 @@ function parseBlockHead(kind: 'if' | 'each' | 'boundary' | 'island' | 'snippet',
   return m ? [m[1], m[2] ?? ''] : null;
 }
 
-function findBlock(src: string, kind: 'if' | 'each' | 'boundary' | 'island' | 'snippet'): RegExpExecArray | null {
+/**
+ * The first `{#kind ...}...{/kind}` block at or after `from`, with absolute
+ * positions and the same match shape the compile loop always used:
+ * [full opener text, ...parsed head parts, body]. `index` and
+ * `index + match[0].length` are therefore absolute - the caller uses the
+ * latter as the new cursor without any further arithmetic.
+ *
+ * The `from` offset is what makes the loop linear: the loop keeps the
+ * template whole and walks a cursor, and a caller-side cache reuses this
+ * result until the cursor passes it, so a template is scanned once per level
+ * instead of once per construct.
+ */
+function findBlockFrom(src: string, kind: 'if' | 'each' | 'boundary' | 'island' | 'snippet', from: number): RegExpExecArray | null {
   const openCand = new RegExp(`\\{#${kind}\\b`, 'g');
   const closeRe = new RegExp(`\\{/${kind}\\}`, 'g');
+  openCand.lastIndex = from;
   let open: RegExpExecArray | null;
   while ((open = openCand.exec(src))) {
     const start = open.index;
@@ -3160,7 +3236,7 @@ function findBlock(src: string, kind: 'if' | 'each' | 'boundary' | 'island' | 's
 
 /**
  *
- *   TEXT, not template source. CSS braces are not rosefd expressions
+ *   TEXT, not template source. CSS braces are not Rose Frame Driver expressions
  *   and broke the build the first time a route shipped a head-level style),
  *   emit a real URL, not literal braces.
  * - an HTML comment is a NOTE, not content: it is dropped. A note that
@@ -3205,11 +3281,11 @@ function compileHead(head: string): string {
 
 /**
  * - "errors an agent can fix" - closed on a real
- * failure from the field. A template directive rosefd does not implement
- * used to reach esbuild as generated code and die THERE: the oboext port
+ * failure from the field. A template directive Rose Frame Driver does not implement
+ * used to reach esbuild as generated code and die THERE: the Eoboext port
  * never wrote, a construct never named, a fix never suggested. An unknown
  * directive is now a build error at the .rose file, with the line, the
- * construct and the rosefd shape that replaces it.
+ * construct and the Rose Frame Driver shape that replaces it.
  *
  * The same gate catches the two shapes findBlock cannot match at all - an
  * Adversarial probing found all three in one afternoon; a template compiler
@@ -3308,8 +3384,8 @@ function assertKnownDirectives(template: string, filePath: string): void {
     }
     throw new RoseError(
       'E-TEMPLATE',
-      `${filePath}: {:${word}} is not a rosefd directive`,
-      { file: filePath, line: lineAt(template, m), hint: 'rosefd templates support {#if}/{:else}, {#each} and {#boundary}' },
+      `${filePath}: {:${word}} is not a Rose Frame Driver directive`,
+      { file: filePath, line: lineAt(template, m), hint: 'Rose Frame Driver templates support {#if}/{:else}, {#each} and {#boundary}' },
     );
   }
   const OPENER_CAND = /\{#(if|each|boundary|island|await)\b/g;
@@ -3419,6 +3495,12 @@ let hoistedConstRenames: Record<string, string> = {};
 // answer plain JS gives for `const x` twice in one scope.
 let hoistedConstNames = new Set<string>();
 let hoistedConstDup: string | null = null;
+// The file being compiled. compileTemplate has no filePath parameter, but one
+// of its error paths (a keyed {#each} over a destructuring pattern) names the
+// file - it interpolated an undeclared `filePath` and threw a ReferenceError
+// instead of the intended hint. Same lifecycle as constUid: set by
+// compileComponent for the one file it is compiling.
+let sourceFilePath = '';
 
 function compileTemplate(
   template: string,
@@ -3431,7 +3513,13 @@ function compileTemplate(
   islandDepth = 0
 ): string {
   let result = '';
-  let remaining = template;
+  // The template stays WHOLE and the loop walks a cursor. Every scan takes an
+  // absolute `from` and every cached result stays valid until the cursor
+  // passes it, so each template is scanned once per level instead of once per
+  // construct - the last O(constructs x template) in this compiler (R47).
+  let src = template;
+  let cursor = 0;
+  let gen = 0;
   let blockId = 0;
 
   const islandsMode = /\{#island\b/.test(template);
@@ -3464,21 +3552,61 @@ function compileTemplate(
       scopeConstIds.set(name, internal);
       renames[name] = internal;
     }
-    template = callifyTemplateExprs(template, [], renames, { ownScope: true, comps });
-    remaining = template;
+    src = callifyTemplateExprs(template, [], renames, { ownScope: true, comps });
   }
 
-  while (remaining.length > 0) {
-    const ifMatch = findBlock(remaining, 'if');
-    const eachMatch = findBlock(remaining, 'each');
-    const boundaryMatch = findBlock(remaining, 'boundary');
-    const firstExpr = firstExprSpan(remaining);
+  // One look-ahead per construct kind. Each scans the template from the
+  // cursor the first time it is asked, then reuses the answer until the
+  // cursor passes it (a hit is the FIRST at/after the cursor, so nothing can
+  // appear between the cursor and it); a miss means there is nothing left of
+  // that kind, which stays true. `gen` invalidates every cache at once when
+  // the const fallback rewrites the remaining text under us.
+  const ahead = <T extends { index: number }>(find: (from: number) => T | null): () => T | null => {
+    let cache: T | null | undefined;
+    let cacheGen = -1;
+    return () => {
+      if (cacheGen !== gen || cache === undefined || (cache !== null && cache.index < cursor)) {
+        cache = find(cursor);
+        cacheGen = gen;
+      }
+      return cache;
+    };
+  };
+  const rawRe = /<(style|script|noscript)\b[^>]*>/g;
+  let lowerSrc: string | null = null;
+  const nextIf = ahead((from) => findBlockFrom(src, 'if', from));
+  const nextEach = ahead((from) => findBlockFrom(src, 'each', from));
+  const nextBoundary = ahead((from) => findBlockFrom(src, 'boundary', from));
+  const nextIsland = ahead((from) => findBlockFrom(src, 'island', from));
+  const nextSnippet = ahead((from) => findBlockFrom(src, 'snippet', from));
+  const nextExpr = ahead((from) => firstExprSpanFrom(src, from));
+  const nextComp = ahead<{ index: number; tag: CompTag }>((from) => {
+    const t = comps.size > 0 ? findCompTagFrom(src, from, comps) : null;
+    return t ? { index: t.start, tag: t } : null;
+  });
+  const nextRaw = ahead((from) => {
+    rawRe.lastIndex = from;
+    const m = rawRe.exec(src);
+    return m ? { index: m.index, tag: m[0], name: m[1].toLowerCase() } : null;
+  });
+  const nextNote = ahead((from) => {
+    const at = src.indexOf('<!--', from);
+    if (at < 0) return null;
+    const close = src.indexOf('-->', at + 4);
+    return { index: at, end: close < 0 ? src.length : close + 3 };
+  });
+
+  while (cursor < src.length) {
+    const ifMatch = nextIf();
+    const eachMatch = nextEach();
+    const boundaryMatch = nextBoundary();
+    const firstExpr = nextExpr();
     const exprMatch = firstExpr
-      ? Object.assign([remaining.slice(firstExpr.start, firstExpr.end + 1), firstExpr.expr], { index: firstExpr.start }) as unknown as RegExpExecArray
+      ? Object.assign([src.slice(firstExpr.index, firstExpr.end + 1), firstExpr.expr], { index: firstExpr.index }) as unknown as RegExpExecArray
       : null;
-    const compTag = comps.size > 0 ? findCompTag(remaining, comps) : null;
-    const islandMatch = findBlock(remaining, 'island');
-    const snippetMatch = findBlock(remaining, 'snippet');
+    const compTag = nextComp()?.tag ?? null;
+    const islandMatch = nextIsland();
+    const snippetMatch = nextSnippet();
 
     const candidates: Array<{ type: string; match: RegExpExecArray; index: number; tag?: CompTag }> = [];
     if (ifMatch?.index !== undefined) candidates.push({ type: 'if', match: ifMatch, index: ifMatch.index });
@@ -3492,37 +3620,37 @@ function compileTemplate(
       ? candidates.reduce((a, b) => (a.index <= b.index ? a : b))
       : null;
 
-    const rawOpenRe = /<(style|script|noscript)\b[^>]*>/g;
-    const rawHit = rawOpenRe.exec(remaining);
+    const rawHit = nextRaw();
     if (rawHit && earliest && rawHit.index < earliest.index) {
-      const tag = rawHit[1].toLowerCase();
-      const closeAt = remaining.toLowerCase().indexOf(`</${tag}`, rawHit.index + rawHit[0].length);
-      const gt = closeAt < 0 ? -1 : remaining.indexOf('>', closeAt);
-      const end = gt < 0 ? remaining.length : gt + 1;
-      result += emitChunk(remaining.slice(0, rawHit.index), acc, closes, scope);
-      result += emitOpenTag(rawHit[0], acc, closes, scope);
-      result += emitChunk(remaining.slice(rawHit.index + rawHit[0].length, end), acc, closes, scope);
-      remaining = remaining.substring(end);
+      // One lowercase copy per level, only when a raw block actually exists:
+      // the close-tag search is case-insensitive by construction (HTML) and
+      // re-lowering the whole template per raw tag was its own O(n) walk.
+      if (lowerSrc === null) lowerSrc = src.toLowerCase();
+      const closeAt = lowerSrc.indexOf(`</${rawHit.name}`, rawHit.index + rawHit.tag.length);
+      const gt = closeAt < 0 ? -1 : src.indexOf('>', closeAt);
+      const end = gt < 0 ? src.length : gt + 1;
+      result += emitChunk(src.slice(cursor, rawHit.index), acc, closes, scope);
+      result += emitOpenTag(rawHit.tag, acc, closes, scope);
+      result += emitChunk(src.slice(rawHit.index + rawHit.tag.length, end), acc, closes, scope);
+      cursor = end;
       continue;
     }
 
-    const noteAt = remaining.indexOf('<!--');
-    if (noteAt >= 0 && (!earliest || noteAt < earliest.index)) {
-      const noteEnd = remaining.indexOf('-->', noteAt + 4);
-      const end = noteEnd < 0 ? remaining.length : noteEnd + 3;
-      result += emitChunk(remaining.slice(0, end), acc, closes, scope);
-      remaining = remaining.substring(end);
+    const note = nextNote();
+    if (note && (!earliest || note.index < earliest.index)) {
+      result += emitChunk(src.slice(cursor, note.end), acc, closes, scope);
+      cursor = note.end;
       continue;
     }
 
     if (!earliest) {
-      result += emitChunk(remaining, acc, closes, scope);
+      result += emitChunk(src.slice(cursor), acc, closes, scope);
       break;
     }
 
     if (earliest.type === 'if') {
       const [, cond, content] = earliest.match;
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       if (before) result += emitChunk(before, acc, closes, scope);
       const call = autoCall(cond);
       const id = nextId();
@@ -3534,10 +3662,10 @@ function compileTemplate(
       } else {
         result += `${acc} += (${call}) ? __b${id}(${scope ?? 'undefined'}, []) : '';\n`;
       }
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     } else if (earliest.type === 'each') {
       const [, items, item, index, key, content] = earliest.match;
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       if (before) result += emitChunk(before, acc, closes, scope);
       const call = autoCall(items);
       const id = nextId();
@@ -3560,8 +3688,8 @@ function compileTemplate(
         if (isDestructure) {
           throw new RoseError(
             'E-TEMPLATE',
-            `${filePath}: a keyed {#each} keys on a named item's property - write {#each xs as x (x.id)}, not a destructuring pattern`,
-            { file: filePath, hint: 'name the item first, then key on one of its properties' },
+            `${sourceFilePath}: a keyed {#each} keys on a named item's property - write {#each xs as x (x.id)}, not a destructuring pattern`,
+            { file: sourceFilePath, hint: 'name the item first, then key on one of its properties' },
           );
         }
         let k = key.trim();
@@ -3582,7 +3710,7 @@ function compileTemplate(
         const param = isDestructure ? '__s' : item;
         result += `${acc} += (${call}).map((${param}${index ? ', __i' : ''}) => __b${id}(${param}, []${index ? ', __i' : ''})).join('');\n`;
       }
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     } else if (earliest.type === 'boundary') {
       const [, fbAttr, content] = earliest.match;
       let fallbackSrc = '';
@@ -3591,7 +3719,7 @@ function compileTemplate(
         if (fbM) fallbackSrc = Buffer.from(fbM[1], 'base64').toString('utf-8');
       }
       const custom = content;
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       if (before) result += emitChunk(before, acc, closes, scope);
       const id = nextId();
       const catchesAction = /\$action:|<form[\s>]/.test(custom);
@@ -3608,30 +3736,29 @@ function compileTemplate(
         ? `try { $actionErrorOrThrow(); __bd${id} = __b${id}(${closes}); } catch (e) { $setBoundaryError(e); __bd${id} = ${fbBlock ? `__bf${id}(${closes})` : '$boundaryFallback(e)'}; }\n`
         : `try { __bd${id} = __b${id}(${closes}); } catch (e) { $setBoundaryError(e); __bd${id} = ${fbBlock ? `__bf${id}(${closes})` : JSON.stringify(BOUNDARY_FALLBACK)}; }\n`;
       result += `${acc} += __bd${id};\n`;
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     } else if (earliest.type === 'snippet') {
       const [, name, params, content] = earliest.match;
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       if (before) result += emitChunk(before, acc, closes, scope);
       const id = nextId();
       const paramList = params ? params.split(',').map(p => p.trim()).filter(Boolean).join(',') : '';
       const inner = compileTemplate(content.trim(), 'h', '__c', '__s', depth + 1, effMarkers, comps, islandDepth);
       result += `__snip.${name} = (__s, __c${paramList ? ',' + paramList : ''}) => { let h = ''; ${inner} return h; };\n`;
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     } else if (earliest.type === 'comp') {
       const tag = earliest.tag!;
-      if (tag.start > 0) result += emitChunk(remaining.substring(0, tag.start), acc, closes, scope);
+      if (tag.start > cursor) result += emitChunk(src.slice(cursor, tag.start), acc, closes, scope);
       const entry = comps.get(tag.name)!;
       const id = nextId();
       let childrenSrc = '';
-      let rest: string;
       if (tag.selfClosing) {
-        rest = remaining.substring(tag.end);
+        cursor = tag.end;
       } else {
-        const closeIdx = findClose(remaining, tag.end, tag.name);
+        const closeIdx = findClose(src, tag.end, tag.name);
         if (closeIdx < 0) throw new RoseError('E-TEMPLATE', `unclosed <${tag.name}> - every component tag needs its matching close tag`, { hint: `add the matching </${tag.name}> (or close the tag with /> when it takes no children)` });
-        childrenSrc = remaining.substring(tag.end, closeIdx);
-        rest = remaining.substring(closeIdx + tag.name.length + 3);
+        childrenSrc = src.slice(tag.end, closeIdx);
+        cursor = closeIdx + tag.name.length + 3;
       }
       const { def, named } = splitSlots(childrenSrc);
       const hasChildren = def.trim().length > 0;
@@ -3664,10 +3791,9 @@ function compileTemplate(
         .join(', ');
       const childrenArg = hasChildren ? `__ch${id}(${scope ?? 'undefined'}, ${closes})` : `''`;
       result += `${acc} += ${tag.name}(${closes}, ${childrenArg}, { ${propsObj} }, { ${slotFns.join(', ')} });\n`;
-      remaining = rest;
     } else if (earliest.type === 'island') {
       const [, name, hydrate, content] = earliest.match;
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       if (before) result += emitChunk(before, acc, closes, scope);
       const hydrateAttr = hydrate === 'visible' || hydrate === 'idle'
         ? ` data-rv-island-hydrate="${hydrate}"`
@@ -3676,16 +3802,16 @@ function compileTemplate(
       const inner = compileTemplate(content.trim(), 'h', '__c', scope, depth + 1, markers, comps, islandDepth + 1);
       result += inner;
       result += `${acc} += '</div>';\n`;
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     } else {
       const [, expr] = earliest.match;
       const trimmed = expr.trim();
-      const before = remaining.substring(0, earliest.index);
+      const before = src.slice(cursor, earliest.index);
       const constMatch = /^@const\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/.exec(trimmed);
       if (constMatch) {
         if (before) result += emitChunk(before, acc, closes, scope);
         const constName = constMatch[1];
-        const rest = remaining.substring(earliest.index + earliest.match[0].length);
+        const rest = src.slice(earliest.index + earliest.match[0].length);
         // A const compiles to a THUNK, exactly like $derived: its
         // expression may read signals, and only a use site that re-reads
         // them (the compiled call) subscribes the wire() effect. Emitting a
@@ -3716,13 +3842,18 @@ function compileTemplate(
         // upfront pass already renamed every use, so the plain rest is what
         // is left; forgetting this line is an infinite loop (the same span
         // matches forever) - which is how the upfront pass first landed.
-        remaining = rest;
+        cursor = earliest.index + earliest.match[0].length;
         if (internal === undefined) {
           // Guard for a construct the expanders left in place that the
           // pre-scan counts as a block boundary: fall back to the old
-          // per-declaration pass so such a template still compiles.
+          // per-declaration pass so such a template still compiles. The pass
+          // rewrites the tail text, so the scan re-bases on it: everything
+          // before the cursor is already emitted, and the generation bump
+          // retires every cached look-ahead position.
           internal = `__rvct${constUid++}`;
-          remaining = callifyTemplateExprs(rest, [], { [constName]: internal });
+          src = callifyTemplateExprs(rest, [], { [constName]: internal });
+          cursor = 0;
+          gen++;
         }
         const decl = `const ${internal} = () => (${constMatch[2].trim()});\n`;
         if (hoistTopLevelConsts && depth === 0) {
@@ -3744,14 +3875,14 @@ function compileTemplate(
       if (trimmed === '__slot__') {
         if (before) result += emitChunk(before, acc, closes, scope);
         result += compileSlot(acc);
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       const slotDefault = /^__slotDefault\(("(?:[^"\\]|\\.)*")\)$/.exec(trimmed);
       if (slotDefault) {
         if (before) result += emitChunk(before, acc, closes, scope);
         result += `${acc} += __slotDefault(children, ${slotDefault[1]});\n`;
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       const slotCall = /^__slot\((['"])(\w+)\1, \[([\s\S]*?)\](?:,\s*("(?:[^"\\]|\\.)*"))?\)$/.exec(trimmed);
@@ -3759,7 +3890,7 @@ function compileTemplate(
         if (before) result += emitChunk(before, acc, closes, scope);
         const fb = slotCall[4] ? `, ${slotCall[4]}` : '';
         result += `${acc} += __slotBlock(${closes}, __sl, ${JSON.stringify(slotCall[2])}, [${slotCall[3]}]${fb});\n`;
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       const rawMatch = /^@html\s+([\s\S]+)$/.exec(trimmed);
@@ -3772,7 +3903,7 @@ function compileTemplate(
           const fn = scope ? `(${scope}) => (${expr})` : `() => (${expr})`;
           result += `${acc} += rawMark(${closes}, ${fn}${scope ? `, ${scope}` : ''});\n`;
         }
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       // F19: {@debug a, b} - the devtool that costs nothing to leave in the source: it logs the named values under one tag.
@@ -3783,23 +3914,23 @@ function compileTemplate(
         result += names
           ? `console.log('[rosefd:debug]', { ${names} });\n`
           : `console.log('[rosefd:debug]'); debugger;\n`;
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       const renderMatch = /^@render\s+([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)\s*$/.exec(trimmed);
       if (renderMatch) {
-        const ahead = new RegExp(`\\{#snippet\\s+${renderMatch[1]}\\b`).test(remaining.substring(earliest.index + earliest.match[0].length));
+        const ahead = new RegExp(`\\{#snippet\\s+${renderMatch[1]}\\b`).test(src.slice(earliest.index + earliest.match[0].length));
         if (ahead) {
           throw new RoseError(
             'E-TEMPLATE',
-            `${filePath}: {@render ${renderMatch[1]}} runs before its {#snippet ${renderMatch[1]}} is defined`,
-            { file: filePath, hint: 'move the {#snippet} definition above the {@render} call - definitions register as the statement stream reaches them' },
+            `${sourceFilePath}: {@render ${renderMatch[1]}} runs before its {#snippet ${renderMatch[1]}} is defined`,
+            { file: sourceFilePath, hint: 'move the {#snippet} definition above the {@render} call - definitions register as the statement stream reaches them' },
           );
         }
         if (before) result += emitChunk(before, acc, closes, scope);
         const renderArgs = renderMatch[2].trim();
         result += `${acc} += ((__snip && __snip.${renderMatch[1]}) ? __snip.${renderMatch[1]}(${scope ?? 'null'}, ${closes}${renderArgs ? ', ' + renderArgs : ''}) : '');\n`;
-        remaining = remaining.substring(earliest.index + earliest.match[0].length);
+        cursor = earliest.index + earliest.match[0].length;
         continue;
       }
       const attrMatch = before.match(/([\w-]+)=\s*$/);
@@ -3809,11 +3940,11 @@ function compileTemplate(
         result += emitAttr(attrMatch[1], trimmed, acc, closes, scope, effMarkers);
       } else {
         if (before) result += emitChunk(before, acc, closes, scope);
-        const after = remaining.substring(earliest.index + earliest.match[0].length);
+        const after = src.slice(earliest.index + earliest.match[0].length);
         const pair = after.length > 0 && !/^<[a-zA-Z/!]/.test(after) && !after.startsWith('{');
         result += emitText(trimmed, acc, closes, scope, effMarkers, pair);
       }
-      remaining = remaining.substring(earliest.index + earliest.match[0].length);
+      cursor = earliest.index + earliest.match[0].length;
     }
   }
 
@@ -3849,8 +3980,8 @@ function scanTagEnd(src: string, start: number): number {
 }
 
 /** The earliest open tag whose name is an imported component . */
-function findCompTag(src: string, comps: Map<string, unknown>): CompTag | null {
-  let i = 0;
+function findCompTagFrom(src: string, from: number, comps: Map<string, unknown>): CompTag | null {
+  let i = from;
   while (i < src.length) {
     const lt = src.indexOf('<', i);
     if (lt < 0) return null;
@@ -3866,6 +3997,10 @@ function findCompTag(src: string, comps: Map<string, unknown>): CompTag | null {
     i = lt + 1;
   }
   return null;
+}
+
+function findCompTag(src: string, comps: Map<string, unknown>): CompTag | null {
+  return findCompTagFrom(src, 0, comps);
 }
 
 function findClose(src: string, from: number, name: string): number {
@@ -4108,7 +4243,7 @@ import { scanContentDir, renderMarkdown, buildRss } from "../cli/content";
 /**
  * in public/) become a sorted srcset on the URL-kept <img>. Zero-dependency
  * by design - the variants themselves are plain files, generated by whatever
- * resizer the app prefers (oboext ships tools/make-variants.mjs). Author-set
+ * resizer the app prefers (Eoboext ships tools/make-variants.mjs). Author-set
  * srcset/sizes always win; no variants means no attribute, byte-identical.
  */
 function listImageVariants(publicDir: string, url: string): Array<{ url: string; width: number }> {
@@ -4399,7 +4534,7 @@ export function buildReport(infos: RouteInfo[], compiled: CompileResult[]): stri
 
 /**
  * The mount entry - the migration door. A foreign
- * page (the legacy half of a micro-frontend, or an old app adopting rosefd
+ * page (the legacy half of a micro-frontend, or an old app adopting Rose Frame Driver
  * one route at a time) marks containers and includes this one file:
  *
  *   <div data-rosefd="/checkout"></div>
@@ -4414,7 +4549,7 @@ export function buildReport(infos: RouteInfo[], compiled: CompileResult[]): stri
  *
  * Written verbatim, not minified: it ships once per app (not once per
  * document) and the servers compress it like any other asset. The cost to a
- * normal rosefd document is zero bytes - nothing references it unless the
+ * normal Rose Frame Driver document is zero bytes - nothing references it unless the
  * host page does.
  */
 const MOUNT_ENTRY = `
@@ -4756,6 +4891,44 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
   }
   const bundleMode = compiled[files.indexOf(rootLayout)]?.bundle ?? 'inline';
   const split = bundleMode === 'split';
+  // Sliced inline: every interactive document inlines the runtime plus ITS OWN
+  // route's render chain only; the other routes' renders live in one shared
+  // nav chunk (/nav.js) fetched on the first cross-route navigation. The
+  // document pays ~a third of the bytes the all-routes inline bundle costs.
+  const sliced = bundleMode === 'sliced';
+  // One file per route PATTERN (params share a slice), named by a stable hash
+  // of the pattern: dist/slices/<key>.js. The server answers sliceKeyFor()
+  // from the same table, so the CLI never recomputes the hash itself.
+  const sliceKey = (pattern: string): string => 's' + fnv1a32(pattern).toString(36);
+  // The names the app's components actually reference out of the runtime's
+  // export surface. A slice publishes exactly these on globalThis (the nav
+  // chunk resolves them through the bridge), so an unused helper never
+  // bloats a document: the scan is identifier-bounded over the GENERATED
+  // client source, which is flat JS, and a false positive only publishes a
+  // name the bundle already carries. The boundary is a lookaround, not \b:
+  // half the runtime's surface is $-prefixed ($query, $data, $store...) and
+  // \b never matches next to a $ - it is not a word character - so every
+  // such name would silently miss the scan and the nav chunk would resolve
+  // it to undefined.
+  const RT_EXPORT_NAMES = RUNTIME_IMPORTS
+    .replace(/^import\s*\{/, '')
+    .replace(/\}\s*from[\s\S]*$/, '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const usedRtNames: string[] = (() => {
+    const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const used = new Set<string>();
+    for (const c of compiled) {
+      if (!c.client) continue;
+      const src = c.client.replace(/^import\s*\{[^}]*\}\s*from\s*'\.\/runtime\.js';/m, '');
+      for (const n of RT_EXPORT_NAMES) {
+        if (used.has(n)) continue;
+        if (new RegExp(`(?<![\\w$])${escRe(n)}(?![\\w$])`).test(src)) used.add(n);
+      }
+    }
+    return RT_EXPORT_NAMES.filter((n) => used.has(n));
+  })();
   const chainOf = (idx: number): number[] => [idx, ...layoutsOf(infos, idx)];
   const loaderInner = (idx: number): string =>
     `load: () => loadChain([${chainOf(idx).map((i) => `() => import('./comp-${i}.client.js')`).join(', ')}])`;
@@ -4840,7 +5013,10 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
       const bufferFlag = compiled[i].buffer ? ', buffer: true' : '';
       const signalFlag = compiled[i].controlSignal ? ', signal: true' : '';
       const guardFlag = compiled[i].guardName ? `, guard: beforeAction_${i}` : '';
-      return `{ pattern: '${info.pattern}', path: '${info.routePath}', render: ${compose(i)}, actions: ${actionMap ? `{ ${actionMap} }` : 'null'}${guardFlag}${csrFlag}${shellFlag}${bufferFlag}${signalFlag} }`;
+      // Sliced mode: the pattern's inline-bundle file. A zero-JS route ships no
+      // script at all, so it has no slice (its document boots nothing).
+      const sliceFlag = sliced && !routeNoJs(i) ? `, slice: '${sliceKey(info.pattern)}'` : '';
+      return `{ pattern: '${info.pattern}', path: '${info.routePath}', render: ${compose(i)}, actions: ${actionMap ? `{ ${actionMap} }` : 'null'}${guardFlag}${csrFlag}${shellFlag}${bufferFlag}${signalFlag}${sliceFlag} }`;
     })
     .join(',\n  ');
 
@@ -4982,6 +5158,22 @@ export const revalidate = [
 export const routeCaches = [
   ${pages.filter(({ i }) => compiled[i].cache !== undefined).map(({ info, i }) => `{ pattern: '${info.pattern}', seconds: ${compiled[i].cache} }`).join(',\n  ')}
 ];
+
+// Hot-cache key dimensions (export const hotVary = ['x-locale']): the shared
+// server caches key on URL + cookie + accept-language only, so a route whose
+// representation is negotiated on its own private header had one client's
+// bytes replayed to another for a whole TTL (BUG.md AB) - and the app's only
+// exits were a query tag (?l=, ?rv=) or no-store, which switches the cache off
+// for the route entirely. Naming the headers here folds them into the key AND
+// into the warm render that fills it, so every value gets its own entry and
+// the cache keeps working.
+export const routeHotVary = [
+  ${[...pages, ...apiRoutes].filter(({ i }) => compiled[i].hotVary).map(({ info, i }) => `{ pattern: '${info.pattern}', dims: ${JSON.stringify(compiled[i].hotVary)} }`).join(',\n  ')}
+];
+export function hotVaryFor(pathname: string): string[] | null {
+  for (const r of routeHotVary) if (matchRoute(r.pattern, pathname)) return r.dims;
+  return null;
+}
 const __dynCache = new Map();
 export function invalidateRenderCache(): void {
   __dynCache.clear();
@@ -5173,28 +5365,38 @@ export function invalidatePath(pathname: string): number {
   }
   return n;
 }
-export function peekRenderCache(pathname: string, cookieHeader: string, search = ''): ReturnType<typeof renderPage> | null {
-  const cfg = routeClass(pathname).cache;
-  if (!cfg) return null;
+// The render memo is a shared store, so its key has to name the whole
+// representation: URL + cookie alone let one visitor's render be replayed to
+// another for the entire memo TTL whenever the route negotiates on a request
+// header - accept-language first (BUG.md AB), then whatever the route itself
+// declared with export const hotVary. dims is the caller-built negotiation
+// fingerprint (accept-language plus the declared headers); it folds in here.
+function __dynKey(pathname: string, cookieHeader: string, search: string, dims: string): string {
   let h = 0x811c9dc5;
-  const c = cookieHeader || '';
+  const c = (cookieHeader || '') + '\\u0000' + (dims || '');
   for (let i = 0; i < c.length; i++) {
     h ^= c.charCodeAt(i);
     h = (h * 0x01000193) >>> 0;
   }
   // The query string is part of the cache key: routes like /search?q= or /archives?year= render different documents per query.
-  const hit = __dynCache.get(pathname + '|' + (search || '') + '|' + h.toString(16));
+  return pathname + '|' + (search || '') + '|' + h.toString(16);
+}
+export function peekRenderCache(pathname: string, cookieHeader: string, search = '', dims = ''): ReturnType<typeof renderPage> | null {
+  const cfg = routeClass(pathname).cache;
+  if (!cfg) return null;
+  const hit = __dynCache.get(__dynKey(pathname, cookieHeader, search, dims));
   return hit && hit.expires > Date.now() ? hit.page : null;
 }
-export async function renderPageCached(pathname: string, cookieHeader: string, search = ''): Promise<ReturnType<typeof renderPage>> {
+// NOTE (R74): this memo caches renderPage's RETURN VALUE - pure HTML/state, NO
+// set-cookie header (see the { html, state, head, status, ... } object at
+// compiler/index.ts:5756). Set-Cookie is read only at the exit layer from the
+// full Response (R57 list-header fix) and guarded at fillHot/refetchHot in
+// R60, NOT here - there is nothing to guard in this layer. Do NOT add a
+// set-cookie guard to this memo.
+export async function renderPageCached(pathname: string, cookieHeader: string, search = '', dims = ''): Promise<ReturnType<typeof renderPage>> {
   const cfg = routeClass(pathname).cache;
   if (!cfg) return renderPage(pathname);
-  let h = 0x811c9dc5;
-  for (let i = 0; i < cookieHeader.length; i++) {
-    h ^= cookieHeader.charCodeAt(i);
-    h = (h * 0x01000193) >>> 0;
-  }
-  const key = pathname + '|' + (search || '') + '|' + h.toString(16);
+  const key = __dynKey(pathname, cookieHeader, search, dims);
   const hit = __dynCache.get(key);
   if (hit && hit.expires > Date.now()) {
     __dynCache.delete(key);
@@ -5421,7 +5623,7 @@ function routeClass(pathname) {
   for (const r of routeHeaders) if (matchRoute(r.pattern, pathname)) { headers = r.headers; break; }
   let cache = null;
   for (const r of routeCaches) if (matchRoute(r.pattern, pathname)) { cache = r; break; }
-  c = { route, stream, buffered, shell, noJs, nonce, headers, cache, lang, dir };
+  c = { route, stream, buffered, shell, noJs, nonce, headers, cache, lang, dir, slice: route ? (route.slice ?? null) : null };
   if (__routeClass.size >= 2000) {
     const oldest = __routeClass.keys().next().value;
     if (oldest !== undefined) __routeClass.delete(oldest);
@@ -5430,6 +5632,15 @@ function routeClass(pathname) {
   return c;
 }
 const __routeClass = new Map();
+
+// Sliced inline: which dist/slices/<key>.js this pathname's document inlines.
+// null for a path that matches no route (the 404 document inlines the
+// runtime-only core) and for a zero-JS route (no script at all). The CLI and
+// the edge adapter ask this instead of re-deriving pattern -> file; the
+// export's existence is also how the edge adapter detects sliced mode.
+${sliced ? `export function sliceKeyFor(pathname) {
+  return routeClass(pathname).slice;
+}` : '// inline/split mode: no per-route bundle files exist'}
 
 // Head blocks (one per component in the route chain) are pulled out of the page html: the shell injects them into <head>.
 function extractHead(rendered) {
@@ -5449,7 +5660,7 @@ export async function renderPage(pathname, form) {
 
 async function renderPageIsolated(pathname, form) {
   clearRequestState();
-  // Cold-start readiness gate (oboext #8): await the app's published DB-ready promise before any $data() read.
+  // Cold-start readiness gate (Eoboext #8): await the app's published DB-ready promise before any $data() read.
   const appReady = globalThis.__rosefdAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;
@@ -5622,7 +5833,7 @@ export async function renderPageStream(pathname, write, shellOpen, clientTag) {
 
 async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
   clearRequestState();
-  // Cold-start readiness gate (oboext #8): same contract as renderPage — await the app's published DB-ready promise before streaming the shell.
+  // Cold-start readiness gate (Eoboext #8): same contract as renderPage — await the app's published DB-ready promise before streaming the shell.
   const appReady = globalThis.__rosefdAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;
@@ -5733,17 +5944,50 @@ export { installContextStore };
     ...(minify ? { minify: true, keepNames: true } : {}),
   }, incremental);
   bundleBuilds.catch(() => {}); // an esbuild failure in the window before the await below must surface there, not as a fatal unhandled rejection
-  const clientImports = split ? '' : compiled
+  const allClientImports = compiled
     .map((_, i) => ({ i }))
     .filter(({ i }) => !infos[i].isApi && !infos[i].isMiddleware && reachable.has(i))
     .map(({ i }) => `import { render as render_${i} } from './comp-${i}.client.js';`)
     .join('\n');
+  const clientImports = split || sliced ? '' : allClientImports;
 
-  const clientRoutes = pages
-    .map(({ info, i }) => (split
-      ? `{ pattern: '${info.pattern}', ${loaderInner(i)} }`
-      : `{ pattern: '${info.pattern}', render: ${compose(i)} }`))
-    .join(',\n  ');
+  const clientRoutes = split
+    ? pages.map(({ info, i }) => `{ pattern: '${info.pattern}', ${loaderInner(i)} }`).join(',\n  ')
+    : pages.map(({ info, i }) => `{ pattern: '${info.pattern}', render: ${compose(i)} }`).join(',\n  ');
+
+  // Sliced variants of the same registry. `own` = the route index whose chain
+  // this document inlines (null = the runtime-only core: every route rides the
+  // nav chunk). A slice imports its own chain statically and points every
+  // other pattern at the shared chunk, so SPA navigation and prefetch resolve
+  // the target render exactly like the all-inline bundle does.
+  const slicedNavLoader = (pattern: string): string => `load: () => __navRoute(${JSON.stringify(pattern)})`;
+  const slicedVariant = (own: number | null): { imports: string; routes: string } => {
+    const chain = own === null ? null : new Set(chainOf(own));
+    const imports = [
+      // The bridge publish needs these bindings in scope; the own chain's
+      // statics follow. Unused names are tree-shaken by esbuild.
+      sliced ? `import { ${usedRtNames.join(', ')} } from './runtime.js';` : '',
+      chain
+        ? compiled
+            .map((_, i) => ({ i }))
+            .filter(({ i }) => chain.has(i) && !infos[i].isApi && !infos[i].isMiddleware && reachable.has(i))
+            .map(({ i }) => `import { render as render_${i} } from './comp-${i}.client.js';`)
+            .join('\n')
+        : '',
+    ].filter(Boolean).join('\n');
+    const routes = pages
+      .map(({ info, i }) => (own !== null && i === own
+        ? `{ pattern: '${info.pattern}', render: ${compose(i)} }`
+        : `{ pattern: '${info.pattern}', ${slicedNavLoader(info.pattern)} }`))
+      .join(',\n  ');
+    return { imports, routes };
+  };
+  // Sliced: the not-found and error renders ride the nav chunk like any other
+  // route's. A 404/500 document matches no route, so it inlines the
+  // runtime-only core and pays one nav fetch at boot - a document nobody
+  // optimises for bytes.
+  const notFoundTableSliced = `[\n${notFoundEntries.map((e) => `  ['${e.prefix}', { load: () => __navNotFound(${JSON.stringify(e.prefix)}) }${e.flags}],`).join('\n')}\n]`;
+  const errorRenderSliced = errIdx >= 0 ? '{ load: () => __navError() }' : 'null';
 
   const prefetchMode = compiled.find((c) => c.prefetch)?.prefetch ?? 'all';
   const lazyHydrationFlag = compiled.find((c) => c.lazyHydration)?.lazyHydration ?? false;
@@ -5779,9 +6023,13 @@ reportVitals();
       if (!known) {`
     : `      if (langIdx >= 0 && !isLocale(pathname.split('/')[langIdx])) {`;
 
-  const clientEntry = `
-${clientImports}
+  // One template, three entry shapes: the all-inline bundle (inline mode), the
+  // external runtime (split mode), and - sliced mode - one runtime-only core
+  // plus one slice per route pattern, each a variant of this same entry.
+  const clientEntryFor = (v: { imports: string; routes: string; publish: string; nav: string; notFoundTable: string; errorRender: string; prefetchDoor?: string }): string => `
+${v.imports}
 import { state, setState, resumeState, clearRequestState, resetEffects, wire, isolateStateAsync, restoreState, setRefreshHook, clearMounts, flushMounts, adoptCleanups, handlers, setActionDispatcher, setLocales, setLocalePacks, ensureLocale, isLocale, localeDir, setPrefetchOverride, serializeState, setFxOwner, resetContainerFx, esc, applyStorePatch } from './runtime.js';
+${v.publish}
 ${compiled.some((c) => c.usesStore) ? `
 // Live store channel: an app that reads a shared $store() keeps one EventSource to
 // /__rosefd_store. A server-side write ($store.set/update from a network listener,
@@ -5808,10 +6056,11 @@ ${vitalsOn ? `// the app asked for web-vitals. The import is what keeps\n// repo
 if (typeof window !== 'undefined') window.__rosefdLazy = ${JSON.stringify(lazyHydrationFlag)};
 // The two pack doors, re-exported for an app that wants to warm a language before its visitor asks for it (ensureLocale) or to feed a dictionary.
 export { ensureLocale, loadLocale } from './runtime.js';
+${v.prefetchDoor}
 ${vitalsBlock}
-
+${v.nav}
 const routes = [
-  ${clientRoutes}
+  ${v.routes}
 ];
 
 // === Mode B: lazy route chunks === Split mode's registry entries arrive without a render function: loadChain loads the route's module graph (the page).
@@ -5832,7 +6081,7 @@ const getRender = async (route) => {
 };
 
 // Not-found pages, deepest segment first (the server's table, client half): the root 404.rose ('/') and any pages/<seg>/_notfound.rose.
-const notFoundRoutes = ${notFoundTable};
+const notFoundRoutes = ${v.notFoundTable};
 const notFoundFor = (pathname) => {
   for (const [prefix, render] of notFoundRoutes) {
     if (prefix === '/' || pathname === prefix || pathname.startsWith(prefix + '/')) return render;
@@ -5841,7 +6090,7 @@ const notFoundFor = (pathname) => {
 };
 
 // whose render throws degrades to this instead of failing the response.
-const errorPage = ${errorRender};
+const errorPage = ${v.errorRender};
 
 // Paint a fallback page (404/500) into the container, wired like any render.
 async function paintFallback(container, page, builtin, keepState = false) {
@@ -6200,8 +6449,137 @@ setRefreshHook(async () => {
   await start(document.getElementById('app'), location.pathname, false);
 });
 `;
-  await fs.promises.writeFile(path.join(buildDir, 'client-entry.js'), clientEntry);
-  const clientBuild: Promise<esbuild.BuildResult> = split
+  // === Sliced mode's two generated pieces ===
+  // The publish: the slice hands the runtime's used surface to the nav chunk
+  // through one global. The tables inside are already globalThis-wide, but the
+  // per-request bags (requestQuery/prefetchOverride) are module state and a
+  // second copy would read its own - $query() would answer the wrong render.
+  const slicedPublish = sliced ? `
+// === Sliced mode: the runtime bridge === The routes this document did NOT
+// inline ride the shared nav chunk, whose components resolve the runtime
+// through this object instead of bundling a second copy. Published before any
+// render runs; the chunk's shim throws if it loads first.
+globalThis.__rosefd_rt = { ${usedRtNames.join(', ')} };` : '';
+  const slicedNavBlock = (navUrl: string): string => sliced ? `
+// === Sliced mode: the shared nav chunk === One file holds every route's
+// render chain this document did not inline, fetched on the first cross-route
+// navigation (or a hover prefetch). __rosefd_navImport is the override seam
+// (tests, or a host page with its own loader); the browser default is a plain
+// dynamic import of the versioned URL, which 'self' in the CSP allows.
+const __navUrl = ${JSON.stringify(navUrl)};
+const __navImport = globalThis.__rosefd_navImport || ((u) => import(u));
+let __navMod = null;
+const __nav = async () => (__navMod ??= await __navImport(__navUrl));
+const __navRoute = async (pattern) => (await __nav()).navRenders[pattern];
+const __navNotFound = async (prefix) => (await __nav()).navNotFound[prefix];
+const __navError = async () => (await __nav()).navError;
+` : '';
+
+  // Non-sliced modes write one entry here. Sliced mode writes the
+  // runtime-only core inside buildSliced (mount.js and 404 documents import
+  // it) and builds the per-route slices after the nav chunk is bundled - the
+  // versioned nav URL is baked into every slice, so nav must exist first.
+  const coreEntrySrc = clientEntryFor({
+    imports: sliced ? slicedVariant(null).imports : clientImports,
+    routes: sliced ? slicedVariant(null).routes : clientRoutes,
+    publish: '',
+    nav: '',
+    notFoundTable: sliced ? notFoundTableSliced : notFoundTable,
+    errorRender: sliced ? errorRenderSliced : errorRender,
+    prefetchDoor: '',
+  });
+  if (!sliced) await fs.promises.writeFile(path.join(buildDir, 'client-entry.js'), coreEntrySrc);
+
+  const buildSliced = async (): Promise<esbuild.BuildResult> => {
+    // The bridge shim, plus per-component copies that import IT: esbuild
+    // resolves './runtime.js' inside the comp files, so the nav build gets
+    // rewritten copies instead of an alias dance.
+    writeIfChanged('runtime-global.js', [
+      '// Sliced-mode bridge (generated): the nav chunk resolves the runtime',
+      '// through the copy the route slice published, so a page runs exactly one',
+      '// runtime. Exports are tree-shaken to what the chunk references.',
+      'const __rt = globalThis.__rosefd_rt;',
+      "if (!__rt) throw new Error('rosefd: the sliced bundle bridge is missing - the route slice did not publish the runtime before the nav chunk loaded');",
+      ...RT_EXPORT_NAMES.map((n) => `export const ${n} = __rt.${n};`),
+    ].join('\n') + '\n');
+    const navCompWrites: Promise<void>[] = [];
+    for (let i = 0; i < compiled.length; i++) {
+      if (infos[i].isApi || !reachable.has(i) || !compiled[i].client) continue;
+      navCompWrites.push(fs.promises.writeFile(
+        path.join(buildDir, `nav-comp-${i}.client.js`),
+        compiled[i].client
+          .replace(/from '\.\/runtime\.js'/g, "from './runtime-global.js'")
+          .replace(/from '\.\/comp-(\d+)\.client\.js'/g, "from './nav-comp-$1.client.js'"),
+      ));
+    }
+    // The nav entry: every route's render chain (pages, not-found, error) as
+    // { render } entries the slices resolve by pattern / prefix.
+    const navEntrySrc = `
+${allClientImports.replace(/from '\.\/comp-(\d+)\.client\.js'/g, "from './nav-comp-$1.client.js'")}
+export const navRenders = {
+  ${pages.map(({ info, i }) => `'${info.pattern}': { render: ${compose(i)} },`).join('\n  ')}
+};
+export const navNotFound = {
+  ${notFoundEntries.map((e) => `'${e.prefix}': { render: ${e.render} },`).join('\n  ')}
+};
+export const navError = ${errIdx >= 0 ? `{ render: ${compose(errIdx)} }` : 'null'};
+`;
+    await Promise.all([...navCompWrites, fs.promises.writeFile(path.join(buildDir, 'nav-entry.js'), navEntrySrc)]);
+    await runEsbuild(path.join(buildDir, 'nav-entry.js'), {
+      entryPoints: [path.join(buildDir, 'nav-entry.js')],
+      bundle: true,
+      outfile: path.join(outDir, 'nav.js'),
+      format: 'esm',
+      platform: 'browser',
+      minify: true,
+      write: true,
+      ...TS_LOADER,
+    }, incremental);
+    const navBytes = await fs.promises.readFile(path.join(outDir, 'nav.js'));
+    const navUrl = '/nav.js?v=' + fnv1a32(navBytes);
+    await rmTreeParallel(path.join(outDir, 'slices'));
+    await fs.promises.mkdir(path.join(outDir, 'slices'), { recursive: true });
+    const variants: Array<{ entryFile: string; outFile: string; own: number | null }> = [
+      { entryFile: 'client-entry.js', outFile: path.join(outDir, 'client.js'), own: null },
+      ...pages.map(({ i }) => {
+        const key = sliceKey(infos[i].pattern);
+        return { entryFile: `slice-entry-${key}.js`, outFile: path.join(outDir, 'slices', `${key}.js`), own: i };
+      }),
+    ];
+    const builds: Promise<esbuild.BuildResult>[] = [];
+    for (const { entryFile, outFile, own } of variants) {
+      const v = slicedVariant(own);
+      const entryPath = path.join(buildDir, entryFile);
+      await fs.promises.writeFile(entryPath, clientEntryFor({
+        imports: v.imports,
+        routes: v.routes,
+        publish: slicedPublish,
+        nav: slicedNavBlock(navUrl),
+        notFoundTable: notFoundTableSliced,
+        errorRender: errorRenderSliced,
+        // The test seam (and any host page) drives $query-dependent renders
+        // through this door; it ships only in sliced mode, where the bridge
+        // makes it meaningful.
+        prefetchDoor: "\nexport { setPrefetchOverride } from './runtime.js';",
+      }));
+      builds.push(runEsbuild(entryPath + ':slice', {
+        entryPoints: [entryPath],
+        bundle: true,
+        outfile: outFile,
+        format: 'esm',
+        platform: 'browser',
+        minify: true,
+        write: true,
+        ...TS_LOADER,
+      }, incremental));
+    }
+    await Promise.all(builds);
+    return {} as esbuild.BuildResult;
+  };
+
+  const clientBuild: Promise<esbuild.BuildResult> = sliced
+    ? buildSliced()
+    : split
     ? (async () => {
         await rmTreeParallel(path.join(outDir, 'chunks'));
         return runEsbuild(path.join(buildDir, 'client-entry.js') + ':split', {
